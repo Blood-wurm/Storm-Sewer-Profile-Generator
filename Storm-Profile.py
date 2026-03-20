@@ -19,6 +19,9 @@ from collections import defaultdict
 
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import (
+    ArrayObject, DictionaryObject, FloatObject, NameObject, NumberObject
+)
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -93,45 +96,131 @@ def _convert_value(val):
 # SECTION 2: DOT TABULATION PDF PARSER
 # =============================================================================
 
-_HEADER_FRAGMENTS = {"Line", "HGL", "EGL", "Up", "Dn"}
+def _norm_cell(cell):
+    """Normalize a cell string for header matching."""
+    return ' '.join((cell or '').split()).strip().upper()
 
-def _find_dot_header_cols(row):
-    """Return (hgl_up_col, hgl_dn_col) from a header row, or (None, None)."""
-    cells = [c.strip() if c else '' for c in row]
-    matches = sum(1 for c in cells if any(f in c for f in _HEADER_FRAGMENTS))
-    if matches < 3:
-        return None, None
-    # Find the first column whose header contains 'HGL' and whose next column
-    # header contains 'Up', with the column after that containing 'Dn'.
+def _find_dot_columns_single(row):
+    """Find DOT column indices from a single header row.
+    Returns dict with possible keys: hgl_up, hgl_dn, total_flow, capacity, line_id."""
+    cells = [_norm_cell(c) for c in row]
+    cols = {}
+    # HGL Up/Dn
     for j, c in enumerate(cells):
         if 'HGL' in c:
-            # Look for adjacent Up/Dn pair
             for k in range(j, min(j + 4, len(cells) - 1)):
-                if 'Up' in cells[k] and k + 1 < len(cells) and 'Dn' in cells[k + 1]:
-                    return k, k + 1
-    return None, None
+                if 'UP' in cells[k] and k + 1 < len(cells) and 'DN' in cells[k + 1]:
+                    cols['hgl_up'] = k
+                    cols['hgl_dn'] = k + 1
+                    break
+    # Total Flow — require both TOTAL and FLOW in same cell
+    for j, c in enumerate(cells):
+        if 'TOTAL' in c and 'FLOW' in c:
+            cols['total_flow'] = j
+            break
+    # Capacity — require CAPACITY or (CAP + FULL) in same cell, exclude CAPTURED
+    for j, c in enumerate(cells):
+        if 'CAPTURED' in c:
+            continue
+        if 'CAPACITY' in c or ('CAP' in c and 'FULL' in c):
+            cols['capacity'] = j
+            break
+    # Line ID
+    for j, c in enumerate(cells):
+        if 'LINE' in c and 'ID' in c:
+            cols['line_id'] = j
+            break
+    return cols
+
+def _find_dot_columns_pair(row1, row2):
+    """Find DOT column indices from a two-row header.
+    DOT tables split headers across two rows:
+      Row 1: ... Total    Cap   ... HGL    EGL    Depth ...
+      Row 2: ... flow     full  ... Up  Dn  Up  Dn  Up  Dn ..."""
+    c1 = [_norm_cell(c) for c in row1]
+    c2 = [_norm_cell(c) for c in row2]
+    cols = {}
+    # HGL: category in row1, Up/Dn in row2
+    for j, c in enumerate(c1):
+        if 'HGL' in c:
+            for k in range(max(0, j - 1), min(j + 4, len(c2) - 1)):
+                if 'UP' in c2[k] and k + 1 < len(c2) and 'DN' in c2[k + 1]:
+                    cols['hgl_up'] = k
+                    cols['hgl_dn'] = k + 1
+                    break
+    # Total Flow: "TOTAL" in row1 confirmed by "FLOW" in row2 at same column
+    for j, c in enumerate(c1):
+        if 'TOTAL' in c and 'FLOW' in c:
+            cols['total_flow'] = j
+            break
+        if 'TOTAL' in c and j < len(c2) and 'FLOW' in c2[j]:
+            cols['total_flow'] = j
+            break
+    # Capacity: "CAP" in row1 confirmed by "FULL" in row2
+    for j, c in enumerate(c1):
+        if 'CAPTURED' in c:
+            continue
+        if 'CAPACITY' in c or ('CAP' in c and 'FULL' in c):
+            cols['capacity'] = j
+            break
+        if ('CAP' in c or 'CAPAC' in c) and j < len(c2) and 'FULL' in c2[j]:
+            cols['capacity'] = j
+            break
+    # Line ID
+    for j, c in enumerate(c1):
+        if 'LINE' in c and 'ID' in c:
+            cols['line_id'] = j
+            break
+    if 'line_id' not in cols:
+        for j, c in enumerate(c2):
+            if 'LINE' in c and 'ID' in c:
+                cols['line_id'] = j
+                break
+    return cols
 
 def _parse_dot_rows_table(table):
-    """Extract {line_no: {'HGL Up': float, 'HGL Dn': float}} from a pdfplumber table."""
+    """Extract per-line data from a pdfplumber table.
+    Handles both single-row and two-row (split) header formats.
+    Returns {line_no: {'HGL Up', 'HGL Dn', 'Line ID', 'Total Flow', 'Capacity'}}."""
     result = {}
-    hgl_up_col = hgl_dn_col = None
-    for row in table:
+    cols = {}
+    data_start = 0
+
+    # Scan for header — try single-row first, then consecutive row pairs
+    for i, row in enumerate(table):
         if not row:
             continue
-        # Try to identify header row
-        if hgl_up_col is None:
-            u, d = _find_dot_header_cols(row)
-            if u is not None:
-                hgl_up_col, hgl_dn_col = u, d
+        cols = _find_dot_columns_single(row)
+        if cols.get('hgl_up') is not None:
+            data_start = i + 1
+            break
+        if i + 1 < len(table) and table[i + 1]:
+            cols = _find_dot_columns_pair(row, table[i + 1])
+            if cols.get('hgl_up') is not None:
+                data_start = i + 2
+                break
+
+    if not cols.get('hgl_up'):
+        return result
+
+    hgl_up_col = cols['hgl_up']
+    hgl_dn_col = cols['hgl_dn']
+    flow_col = cols.get('total_flow')
+    cap_col = cols.get('capacity')
+    lid_col = cols.get('line_id')
+
+    # Parse data rows
+    for row in table[data_start:]:
+        if not row:
             continue
-        # Data row: col 0 must be a positive integer line number
-        raw_ln = row[0].strip() if row[0] else ''
+        raw_ln = (row[0] or '').strip()
         try:
             line_no = int(raw_ln)
             if line_no <= 0:
                 continue
         except (ValueError, AttributeError):
             continue
+        # HGL (required)
         try:
             hgl_up = float(row[hgl_up_col]) if row[hgl_up_col] else None
             hgl_dn = float(row[hgl_dn_col]) if row[hgl_dn_col] else None
@@ -139,25 +228,54 @@ def _parse_dot_rows_table(table):
             continue
         if hgl_up is None or hgl_dn is None:
             continue
-        result[line_no] = {'HGL Up': hgl_up, 'HGL Dn': hgl_dn}
+        entry = {'HGL Up': hgl_up, 'HGL Dn': hgl_dn}
+        # Line ID — use detected column, or last non-empty cell as fallback
+        if lid_col is not None and lid_col < len(row) and row[lid_col]:
+            entry['Line ID'] = row[lid_col].strip()
+        else:
+            for ci in range(len(row) - 1, 0, -1):
+                if row[ci] and not row[ci].strip().replace('.','').replace('-','').isdigit():
+                    entry['Line ID'] = row[ci].strip()
+                    break
+        # Total Flow (optional)
+        if flow_col is not None:
+            try:
+                entry['Total Flow'] = float(row[flow_col]) if row[flow_col] else None
+            except (ValueError, TypeError, IndexError):
+                entry['Total Flow'] = None
+        # Capacity (optional)
+        if cap_col is not None:
+            try:
+                entry['Capacity'] = float(row[cap_col]) if row[cap_col] else None
+            except (ValueError, TypeError, IndexError):
+                entry['Capacity'] = None
+        result[line_no] = entry
     return result
 
 def _parse_dot_rows_regex(text):
-    """Fallback: extract {line_no: {'HGL Up': float, 'HGL Dn': float}} via regex."""
+    """Fallback: extract per-line data via regex.
+    Returns {line_no: {'HGL Up', 'HGL Dn', 'Line ID', 'Total Flow', 'Capacity'}}.
+    DOT columns: LineNo ToLine Len DrngI DrngT Rnoff AxCI AxCT TcIn TcSys Rain
+                 TotalFlow Capacity Vel PipeSize Slope InvUp InvDn HGLUp HGLDn
+                 GrdUp GrdDn LineID"""
     result = {}
     for raw_line in text.split('\n'):
         line = raw_line.strip()
         dot_match = re.match(
-            r'^(\d+)\s+\S+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+'
-            r'[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+'
-            r'[\d.]+\s+[\d.]+\s+\d+\s+[\d.]+\s+'
+            r'^(\d+)\s+(\S+)\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+'
+            r'[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+'
+            r'([\d.]+)\s+([\d.]+)\s+'
+            r'[\d.]+\s+\d+\s+[\d.]+\s+'
             r'([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+'
             r'[\d.]+\s+[\d.]+\s+(.+)$', line)
         if dot_match:
             line_no = int(dot_match.group(1))
             result[line_no] = {
-                'HGL Up': float(dot_match.group(4)),
-                'HGL Dn': float(dot_match.group(5)),
+                'Line ID': dot_match.group(9).strip(),
+                'Total Flow': float(dot_match.group(3)),
+                'Capacity': float(dot_match.group(4)),
+                'HGL Up': float(dot_match.group(7)),
+                'HGL Dn': float(dot_match.group(8)),
             }
     return result
 
@@ -206,13 +324,14 @@ def parse_dot_pdf(filepath):
                 "horizontal_strategy": "text",
             }
             tables = page.extract_tables(table_settings)
+            page_data = {}
             if tables:
                 for table in tables:
                     parsed = _parse_dot_rows_table(table)
-                    current['data'].update(parsed)
-            else:
-                parsed = _parse_dot_rows_regex(text)
-                current['data'].update(parsed)
+                    page_data.update(parsed)
+            if not page_data:
+                page_data = _parse_dot_rows_regex(text)
+            current['data'].update(page_data)
 
     # Set project file on all entries
     for r in results:
@@ -351,7 +470,7 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
         ax.plot(gr, ge, color=COLOR_GROUND, linewidth=LW_GND, zorder=5)
     # Pipes
     for i in range(np_):
-        x_start = sw if i == 0 else R[i] + hw
+        x_start = R[i] + hw
         x_end = R[i+1] - hw
         rise = S[i]['rise']
         cr_start = I[i] + rise
@@ -373,9 +492,7 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
     if any(s['hgl_dn'] is not None for s in S):
         for i, s in enumerate(S):
             if s['hgl_dn'] is not None and s['hgl_up'] is not None:
-                x_start = sw if i == 0 else R[i] + hw
-                x_end = R[i+1] - hw
-                ax.plot([x_start, x_end], [s['hgl_dn'], s['hgl_up']], color=COLOR_HGL, linewidth=LW_HGL, zorder=6)
+                ax.plot([R[i], R[i+1]], [s['hgl_dn'], s['hgl_up']], color=COLOR_HGL, linewidth=LW_HGL, zorder=6)
             if i < np_ - 1:
                 nd = S[i+1]['hgl_dn']
                 if s['hgl_up'] is not None and nd is not None:
@@ -386,14 +503,14 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
         r, inv, grd = R[i], I[i], G[i]
         if grd <= 0 or r in drawn: continue
         drawn.add(r)
-        bl = 0 if r == 0 else r - hw
+        bl = r - hw
         ax.add_patch(patches.Rectangle(
             (bl, inv), sw, grd - inv,
-            lw=1.2, ec=COLOR_STRUCTURE, fc='none', zorder=7,
+            lw=1.2, ec=COLOR_STRUCTURE, fc='none', zorder=7, clip_on=False,
             # hatch='///', alpha=0.4,  # structure box hatch (disabled)
         ))
         sq = (emax - emin) * 0.012
-        ax.add_patch(patches.Rectangle((bl + hw*0.2, inv), sw*0.6, sq, lw=0.5, ec=COLOR_STRUCTURE, fc=COLOR_STRUCTURE, zorder=8))
+        ax.add_patch(patches.Rectangle((bl + hw*0.2, inv), sw*0.6, sq, lw=0.5, ec=COLOR_STRUCTURE, fc=COLOR_STRUCTURE, zorder=8, clip_on=False))
     # Error annotation
     errors = []
     for i in range(nn):
@@ -415,16 +532,19 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
         ax.plot([rm, rm], [cm, ly], color='#999999', lw=0.6, zorder=3)
         ax.plot(rm, cm, marker='_', color='#999999', ms=4, zorder=3)
         ax.text(rm, ly, f"Ln: {s['line_no']}\n{s['size_label']}", ha='center', va='bottom', fontsize=9, color='#333333', zorder=10)
-    ax.set_xlabel('Reach (ft)', fontsize=11, fontweight='bold')
-    ax.set_ylabel('Elev. (ft)', fontsize=11, fontweight='bold')
     ax.set_xlim(0, xmax); ax.set_ylim(emin, emax)
+    axes_width_points = fig.get_figwidth() * (0.95 - 0.08) * 72
+    points_per_data_unit = axes_width_points / xmax
+    overhang_pad = hw * points_per_data_unit
+    ax.set_xlabel('Reach (ft)', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Elev. (ft)', fontsize=11, fontweight='bold', labelpad=4 + overhang_pad )
     _auto_ticks(ax, xmax, emin, emax)
-    ax.tick_params(axis='y', labelsize=9, pad=10); ax.tick_params(axis='x', labelsize=9)
+    ax.tick_params(axis='y', labelsize=9, pad=10 + overhang_pad); ax.tick_params(axis='x', labelsize=9)
     ax.set_title('Storm Sewer Profile', fontsize=14, fontweight='bold', loc='left', pad=15)
     if project_name: ax.text(0.99, 1.02, f'Proj. file: {project_name}', transform=ax.transAxes, ha='right', va='bottom', fontsize=9, color='#555555')
     if return_period: ax.text(0.99, 1.06, return_period, transform=ax.transAxes, ha='right', va='bottom', fontsize=14, fontweight='bold', color=COLOR_TITLE_RP)
     ax.text(0.99, -0.08, 'Storm Sewer Profile Generator', transform=ax.transAxes, ha='right', va='top', fontsize=7, color='#999999')
-    fig.subplots_adjust(left=0.08, right=0.95, top=0.88, bottom=0.10)
+    fig.subplots_adjust(left=0.15, right=0.95, top=0.88, bottom=0.10)
     return fig
 
 def _auto_ticks(ax, rmax, emin, emax):
@@ -662,6 +782,219 @@ def _print_debug_table(profile, pl, rl):
 
 
 # =============================================================================
+# SECTION 6b: SYSTEM CHECK
+# =============================================================================
+
+def _add_highlight_rect(page, x1, y1, x2, y2):
+    """Add a translucent red rectangle annotation to a pypdf page."""
+    annot = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"),
+        NameObject("/Subtype"): NameObject("/Square"),
+        NameObject("/Rect"): ArrayObject([
+            FloatObject(x1), FloatObject(y1),
+            FloatObject(x2), FloatObject(y2),
+        ]),
+        NameObject("/IC"): ArrayObject([
+            FloatObject(1.0), FloatObject(0.85), FloatObject(0.85),
+        ]),
+        NameObject("/C"): ArrayObject([
+            FloatObject(1.0), FloatObject(0.0), FloatObject(0.0),
+        ]),
+        NameObject("/CA"): FloatObject(0.3),
+        NameObject("/BS"): DictionaryObject({
+            NameObject("/Type"): NameObject("/Border"),
+            NameObject("/W"): FloatObject(0),
+        }),
+        NameObject("/F"): NumberObject(4),
+    })
+    if NameObject("/Annots") not in page:
+        page[NameObject("/Annots")] = ArrayObject()
+    page[NameObject("/Annots")].append(annot)
+
+def _highlight_dot_rows(writer_page, plumber_page, failing_lines):
+    """Add red highlight rectangles to rows for lines where Total Flow > Capacity."""
+    words = plumber_page.extract_words()
+    if not words:
+        return
+    page_height = float(plumber_page.height)
+    page_width = float(plumber_page.width)
+
+    # Group words into rows by vertical position
+    rows = defaultdict(list)
+    for w in words:
+        row_key = round(w['top'] / 2) * 2
+        rows[row_key].append(w)
+
+    for row_key in sorted(rows):
+        row_words = rows[row_key]
+        leftmost = min(row_words, key=lambda w: w['x0'])
+        # Only consider words near the left margin (first column)
+        if leftmost['x0'] > page_width * 0.08:
+            continue
+        try:
+            ln = int(leftmost['text'].strip())
+        except (ValueError, AttributeError):
+            continue
+        if ln not in failing_lines:
+            continue
+        # Row bounds with padding
+        top = min(w['top'] for w in row_words) - 1
+        bottom = max(w['bottom'] for w in row_words) + 1
+        # Convert pdfplumber coords (top-down) to PDF coords (bottom-up)
+        pdf_y1 = page_height - bottom
+        pdf_y2 = page_height - top
+        _add_highlight_rect(writer_page, 0, pdf_y1, page_width, pdf_y2)
+
+def _create_check_summary_pages(all_failures):
+    """Create matplotlib summary pages listing all capacity exceedances.
+    Returns list of figures (multiple pages if >30 rows)."""
+    figures = []
+    max_rows = 30
+
+    if not all_failures:
+        fig, ax = plt.subplots(figsize=(11, 8.5))
+        ax.axis('off')
+        ax.text(0.5, 0.55, 'System Check \u2014 Capacity Exceedance Summary',
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=16, fontweight='bold')
+        ax.text(0.5, 0.45, 'All lines OK \u2014 no capacity exceedances found.',
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=14, color='#228B22')
+        ax.text(0.99, 0.01, 'Storm Sewer Profile Generator',
+                transform=ax.transAxes, ha='right', va='bottom',
+                fontsize=7, color='#999999')
+        fig.subplots_adjust(left=0.05, right=0.98, top=0.92, bottom=0.05)
+        figures.append(fig)
+        return figures
+
+    col_labels = ['File', 'Return Period', 'Line No', 'Line ID',
+                  'Total Flow', 'Capacity', 'Flow/Cap']
+    all_rows = []
+    for f in all_failures:
+        ratio = f['total_flow'] / f['capacity'] if f['capacity'] > 0 else float('inf')
+        all_rows.append([
+            f['file'], f['return_period'], str(f['line_no']),
+            f.get('line_id', ''),
+            f'{f["total_flow"]:.2f}', f'{f["capacity"]:.2f}',
+            f'{ratio:.2f}',
+        ])
+
+    n_pages = max(1, (len(all_rows) + max_rows - 1) // max_rows)
+    for pg in range(n_pages):
+        fig, ax = plt.subplots(figsize=(11, 8.5))
+        ax.axis('off')
+        start = pg * max_rows
+        end = min(start + max_rows, len(all_rows))
+        page_rows = all_rows[start:end]
+
+        page_label = f'  (Page {pg+1} of {n_pages})' if n_pages > 1 else ''
+        ax.text(0.0, 1.0, f'System Check \u2014 Capacity Exceedance Summary{page_label}',
+                transform=ax.transAxes, ha='left', va='top',
+                fontsize=14, fontweight='bold')
+        count_text = f'{len(all_failures)} line{"s" if len(all_failures) != 1 else ""} exceed capacity'
+        ax.text(0.0, 0.955, count_text, transform=ax.transAxes, ha='left', va='top',
+                fontsize=10, color='#CC0000')
+
+        tbl = ax.table(
+            cellText=page_rows, colLabels=col_labels,
+            loc='upper center', cellLoc='center',
+            bbox=[0.0, 0.02, 1.0, 0.92],
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        # Header style
+        for j in range(len(col_labels)):
+            cell = tbl[0, j]
+            cell.set_facecolor('#2a5d9f')
+            cell.set_text_props(color='white', fontweight='bold')
+        # Row shading by severity
+        for i in range(len(page_rows)):
+            idx = start + i
+            ratio = all_failures[idx]['total_flow'] / all_failures[idx]['capacity'] if all_failures[idx]['capacity'] > 0 else float('inf')
+            if ratio >= 1.5:
+                bg = '#FFCCCC'
+            elif ratio >= 1.2:
+                bg = '#FFE0CC'
+            else:
+                bg = '#FFFFCC'
+            for j in range(len(col_labels)):
+                tbl[i + 1, j].set_facecolor(bg)
+
+        ax.text(0.99, 0.005, 'Storm Sewer Profile Generator',
+                transform=ax.transAxes, ha='right', va='bottom',
+                fontsize=7, color='#999999')
+        fig.subplots_adjust(left=0.05, right=0.98, top=0.92, bottom=0.03)
+        figures.append(fig)
+
+    return figures
+
+def generate_system_check(dot_paths, output_path='system_check.pdf'):
+    """Generate a system check PDF highlighting lines where Total Flow > Capacity.
+    Produces a summary page followed by annotated copies of all DOT pages."""
+    writer = PdfWriter()
+    all_failures = []
+
+    for fp in dot_paths:
+        print(f"\nChecking: {os.path.basename(fp)}")
+        entries = parse_dot_pdf(fp)
+        if not entries:
+            print(f"  No DOT tabulations found — skipped")
+            continue
+        for entry in entries:
+            rp = entry['return_period']
+            pf = entry['project_file'] or os.path.splitext(os.path.basename(fp))[0]
+            data = entry['data']
+            dot_pages = entry['dot_pages']
+            # Identify failing lines
+            failing_lines = set()
+            for ln, d in data.items():
+                tf = d.get('Total Flow')
+                cap = d.get('Capacity')
+                if tf is not None and cap is not None and tf > cap:
+                    failing_lines.add(ln)
+                    all_failures.append({
+                        'file': pf, 'return_period': rp,
+                        'line_no': ln, 'line_id': d.get('Line ID', ''),
+                        'total_flow': tf, 'capacity': cap,
+                    })
+            n_fail = len(failing_lines)
+            n_total = len(data)
+            print(f"  {rp}: {n_fail} of {n_total} lines exceed capacity")
+            # Copy DOT pages and overlay highlights
+            with pdfplumber.open(fp) as plumber_pdf:
+                reader = PdfReader(fp)
+                for page_idx in dot_pages:
+                    writer.add_page(reader.pages[page_idx])
+                    if failing_lines:
+                        _highlight_dot_rows(
+                            writer.pages[-1],
+                            plumber_pdf.pages[page_idx],
+                            failing_lines,
+                        )
+
+    # Build summary page(s)
+    all_failures.sort(key=lambda x: (x['file'], x['return_period'], x['line_no']))
+    summary_figs = _create_check_summary_pages(all_failures)
+
+    # Insert summary at front of output
+    final = PdfWriter()
+    for fig in summary_figs:
+        tp = _fig_to_temp_pdf(fig, 'check_summary')
+        plt.close(fig)
+        summary_reader = PdfReader(tp)
+        for p in summary_reader.pages:
+            final.add_page(p)
+        os.unlink(tp)
+    for p in writer.pages:
+        final.add_page(p)
+
+    with open(output_path, 'wb') as f:
+        final.write(f)
+    print(f"\nSystem check complete: {len(all_failures)} exceedances found")
+    print(f"{len(final.pages)} pages written to {output_path}")
+
+
+# =============================================================================
 # SECTION 7: CLI
 # =============================================================================
 
@@ -741,7 +1074,10 @@ def launch_gui():
     tk.Button(ro,text="Browse...",font=FS,command=bo,padx=10).pack(side='left')
     bfr=tk.Frame(ct,bg=BG); bfr.pack(fill='x',pady=(8,6))
     gb=tk.Button(bfr,text="Generate Deliverable",font=("Segoe UI",11,"bold"),bg=BBG,fg=BFG,activebackground="#1e4a80",activeforeground="white",padx=20,pady=6,cursor="hand2")
-    gb.pack()
+    gb.pack(side='left',expand=True)
+    SCB="#8B0000"; SCA="#6B0000"
+    sb=tk.Button(bfr,text="System Check",font=("Segoe UI",11,"bold"),bg=SCB,fg=BFG,activebackground=SCA,activeforeground="white",padx=20,pady=6,cursor="hand2")
+    sb.pack(side='left',expand=True,padx=(10,0))
     tk.Label(ct,text="Log:",font=FL,bg=BG,anchor='w').pack(fill='x',pady=(8,2))
     lf=tk.Frame(ct,bg=FBG,relief='sunken',bd=1); lf.pack(fill='both',expand=True)
     lt=tk.Text(lf,font=FM,wrap='word',state='disabled',bg=FBG,bd=0,padx=6,pady=4)
@@ -769,7 +1105,29 @@ def launch_gui():
             finally:
                 sys.stdout=old; root.after(0,lambda:gb.configure(state='normal',text="Generate Deliverable"))
         threading.Thread(target=dw,daemon=True).start()
-    gb.configure(command=rg); root.mainloop()
+    def rsc():
+        pdfs=[f for f in file_list if f.lower().endswith('.pdf')]
+        if not pdfs: messagebox.showwarning("No PDFs","Add DOT PDF files for system check."); return
+        op=ov.get().strip()
+        if not op: messagebox.showwarning("No Output","Specify output path."); return
+        base,ext=os.path.splitext(op)
+        sc_out=f"{base}_check{ext}"
+        for fp in pdfs:
+            if not os.path.isfile(fp): messagebox.showerror("Not Found",f"Missing:\n{fp}"); return
+        lt.configure(state='normal'); lt.delete('1.0',tk.END); lt.configure(state='disabled')
+        sb.configure(state='disabled',text="Checking...")
+        old=sys.stdout; sys.stdout=LR(lt)
+        def dw():
+            try:
+                generate_system_check(pdfs, sc_out)
+                root.after(0,lambda:messagebox.showinfo("Complete",f"System check saved to:\n{sc_out}"))
+            except Exception as e:
+                root.after(0,lambda:messagebox.showerror("Error",str(e)))
+                import traceback; traceback.print_exc()
+            finally:
+                sys.stdout=old; root.after(0,lambda:sb.configure(state='normal',text="System Check"))
+        threading.Thread(target=dw,daemon=True).start()
+    gb.configure(command=rg); sb.configure(command=rsc); root.mainloop()
 
 
 if __name__ == '__main__':
