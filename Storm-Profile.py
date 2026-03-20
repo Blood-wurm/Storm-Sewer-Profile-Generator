@@ -349,11 +349,13 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
         if g > 0: gr.append(r); ge.append(g)
     if gr:
         ax.plot(gr, ge, color=COLOR_GROUND, linewidth=LW_GND, zorder=5)
-        ax.fill_between(gr, emin, ge, color='#8B5E3C', alpha=0.18, zorder=1)
     # Pipes
     for i in range(np_):
         x_start = sw if i == 0 else R[i] + hw
         x_end = R[i+1] - hw
+        if G[i] > 0 and G[i+1] > 0:
+            ax.fill_between([x_start, x_end], emin, [G[i], G[i+1]],
+                            color='#8B5E3C', alpha=0.18, zorder=1)
         ax.plot([x_start, x_end], [I[i], I[i+1]], color=COLOR_INVERT, linewidth=LW_INV, zorder=4)
         ax.plot([x_start, x_end], [C[i], C[i+1]], color=COLOR_CROWN, linewidth=LW_CRN, zorder=4)
         # Pipe barrel hatch (disabled)
