@@ -350,6 +350,11 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
     if gr:
         ax.plot(gr, ge, color=COLOR_GROUND, linewidth=LW_GND, zorder=5)
     # Pipes
+    # TODO: pipe crown/invert lines currently connect node elevations directly,
+    # so when a downstream pipe is larger than the upstream pipe the drawn pipe
+    # width (rise) appears to change mid-segment. Each segment should be drawn
+    # at a constant rise using its own Rise value rather than interpolating
+    # between adjacent node crown elevations.
     for i in range(np_):
         x_start = sw if i == 0 else R[i] + hw
         x_end = R[i+1] - hw
