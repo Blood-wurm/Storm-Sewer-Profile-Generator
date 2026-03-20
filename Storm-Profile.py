@@ -502,12 +502,25 @@ def plot_plan_view(lines, project_name=''):
                             fontsize=6, ha='center', va='center', color='#333333', zorder=6,
                             bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='none', alpha=0.85),
                             arrowprops=dict(arrowstyle='-', color='#888888', lw=0.8))
-    ax.set_xlim(xmn-xp, xmx+xp); ax.set_ylim(ymn-yp, ymx+yp)
-    ax.set_aspect('equal')
+    # Match frame size to profile plots by filling the axes box exactly.
+    # Instead of set_aspect('equal') (which shrinks the axes), expand whichever
+    # data dimension is too narrow so the coordinate ratio equals the axes ratio.
+    _l, _r, _t, _b = 0.08, 0.95, 0.88, 0.10
+    axes_aspect = (_r - _l) * 11.0 / ((_t - _b) * 8.5)  # width/height in inches
+    data_w = (xmx + xp) - (xmn - xp)
+    data_h = (ymx + yp) - (ymn - yp)
+    if data_w / data_h < axes_aspect:
+        extra = (axes_aspect * data_h - data_w) / 2
+        ax.set_xlim(xmn - xp - extra, xmx + xp + extra)
+        ax.set_ylim(ymn - yp, ymx + yp)
+    else:
+        extra = (data_w / axes_aspect - data_h) / 2
+        ax.set_xlim(xmn - xp, xmx + xp)
+        ax.set_ylim(ymn - yp - extra, ymx + yp + extra)
     ax.tick_params(labelbottom=False, labelleft=False, bottom=False, left=False)
     ax.set_title(f'Hydraflow Plan View\n{project_name}', fontsize=14, fontweight='bold', loc='left', pad=10)
     for sp in ax.spines.values(): sp.set_linewidth(1.5)
-    fig.subplots_adjust(left=0.08, right=0.95, top=0.88, bottom=0.10)
+    fig.subplots_adjust(left=_l, right=_r, top=_t, bottom=_b)
     return fig
 
 
