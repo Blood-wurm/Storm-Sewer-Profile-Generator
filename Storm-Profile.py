@@ -329,7 +329,7 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
         fig, ax = plt.subplots(1, 1, figsize=(11, 8.5))
     else:
         fig = ax.get_figure()
-    R, G, I, C, S = profile['reach'], profile['ground'], profile['invert'], profile['crown'], profile['segments']
+    R, G, I, S = profile['reach'], profile['ground'], profile['invert'], profile['segments']
     np_ = len(S); nn = len(R)
     vg = [g for g in G if g > 0]; vi = [v for v in I if v > 0]
     ae = vg + vi
@@ -350,16 +350,14 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
     if gr:
         ax.plot(gr, ge, color=COLOR_GROUND, linewidth=LW_GND, zorder=5)
     # Pipes
-    # TODO: pipe crown/invert lines currently connect node elevations directly,
-    # so when a downstream pipe is larger than the upstream pipe the drawn pipe
-    # width (rise) appears to change mid-segment. Each segment should be drawn
-    # at a constant rise using its own Rise value rather than interpolating
-    # between adjacent node crown elevations.
     for i in range(np_):
         x_start = sw if i == 0 else R[i] + hw
         x_end = R[i+1] - hw
+        rise = S[i]['rise']
+        cr_start = I[i] + rise
+        cr_end   = I[i+1] + rise
         ax.plot([x_start, x_end], [I[i], I[i+1]], color=COLOR_INVERT, linewidth=LW_INV, zorder=4)
-        ax.plot([x_start, x_end], [C[i], C[i+1]], color=COLOR_CROWN, linewidth=LW_CRN, zorder=4)
+        ax.plot([x_start, x_end], [cr_start, cr_end], color=COLOR_CROWN, linewidth=LW_CRN, zorder=4)
         # Pipe barrel hatch (disabled)
         # ax.fill_between(
         #     [x_start, x_end],
@@ -413,7 +411,7 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
     # Labels
     lo = (emax - emin) * 0.06
     for i, s in enumerate(S):
-        rm = (R[i] + R[i+1]) / 2.0; cm = (C[i] + C[i+1]) / 2.0; ly = cm + lo
+        rm = (R[i] + R[i+1]) / 2.0; cm = (I[i] + I[i+1]) / 2.0 + s['rise']; ly = cm + lo
         ax.plot([rm, rm], [cm, ly], color='#999999', lw=0.6, zorder=3)
         ax.plot(rm, cm, marker='_', color='#999999', ms=4, zorder=3)
         ax.text(rm, ly, f"Ln: {s['line_no']}\n{s['size_label']}", ha='center', va='bottom', fontsize=9, color='#333333', zorder=10)
