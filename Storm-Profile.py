@@ -353,9 +353,6 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
     for i in range(np_):
         x_start = sw if i == 0 else R[i] + hw
         x_end = R[i+1] - hw
-        if G[i] > 0 and G[i+1] > 0:
-            ax.fill_between([x_start, x_end], emin, [G[i], G[i+1]],
-                            color='#8B5E3C', alpha=0.18, zorder=1)
         ax.plot([x_start, x_end], [I[i], I[i+1]], color=COLOR_INVERT, linewidth=LW_INV, zorder=4)
         ax.plot([x_start, x_end], [C[i], C[i+1]], color=COLOR_CROWN, linewidth=LW_CRN, zorder=4)
         # Pipe barrel hatch (disabled)
@@ -488,21 +485,23 @@ def plot_plan_view(lines, project_name=''):
         if nx:
             dx = x - sum(nx)/len(nx); dy = y - sum(ny)/len(ny)
             mag = max((dx**2+dy**2)**0.5, 1)
-            ox = (dx/mag) * xp * 0.12; oy = (dy/mag) * yp * 0.12
+            ox = (dx/mag) * xp * 0.28; oy = (dy/mag) * yp * 0.28
         else:
-            ox = xp * 0.04; oy = 0
+            ox = xp * 0.10; oy = 0
         if 'Outfall' in labels:
             ax.plot(x, y, 'o', color='black', ms=ms+2, zorder=5)
-            ax.text(x+ox, y+oy, 'Outfall', fontsize=7, ha='center', va='center',
-                    color='black', zorder=6,
-                    bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='none', alpha=0.7))
+            ax.annotate('Outfall', xy=(x, y), xytext=(x+ox, y+oy),
+                        fontsize=7, ha='center', va='center', color='black', zorder=6,
+                        bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='none', alpha=0.85),
+                        arrowprops=dict(arrowstyle='-', color='#888888', lw=0.8))
         else:
             ax.plot(x, y, 's', color='#2a5d9f', ms=ms, zorder=5)
             lt = '/'.join([l for l in labels if l])
             if lt:
-                ax.text(x+ox, y+oy, lt, fontsize=6, ha='center', va='center',
-                        color='#333333', zorder=6,
-                        bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='none', alpha=0.7))
+                ax.annotate(lt, xy=(x, y), xytext=(x+ox, y+oy),
+                            fontsize=6, ha='center', va='center', color='#333333', zorder=6,
+                            bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='none', alpha=0.85),
+                            arrowprops=dict(arrowstyle='-', color='#888888', lw=0.8))
     ax.set_xlim(xmn-xp, xmx+xp); ax.set_ylim(ymn-yp, ymx+yp)
     ax.set_aspect('equal')
     ax.tick_params(labelbottom=False, labelleft=False, bottom=False, left=False)
