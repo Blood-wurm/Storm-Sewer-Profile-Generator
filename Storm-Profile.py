@@ -349,23 +349,24 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
         if g > 0: gr.append(r); ge.append(g)
     if gr:
         ax.plot(gr, ge, color=COLOR_GROUND, linewidth=LW_GND, zorder=5)
-        ax.fill_between(gr, ge, emax, color=COLOR_GROUND, alpha=0.08, zorder=1)
+        ax.fill_between(gr, emin, ge, color='#8B5E3C', alpha=0.18, zorder=1)
     # Pipes
     for i in range(np_):
         x_start = sw if i == 0 else R[i] + hw
         x_end = R[i+1] - hw
         ax.plot([x_start, x_end], [I[i], I[i+1]], color=COLOR_INVERT, linewidth=LW_INV, zorder=4)
         ax.plot([x_start, x_end], [C[i], C[i+1]], color=COLOR_CROWN, linewidth=LW_CRN, zorder=4)
-        ax.fill_between(
-            [x_start, x_end],
-            [I[i], I[i+1]],
-            [C[i], C[i+1]],
-            facecolor='none',
-            edgecolor=COLOR_INVERT,
-            alpha=0.3,
-            hatch='///',
-            zorder=3,
-        )
+        # Pipe barrel hatch (disabled)
+        # ax.fill_between(
+        #     [x_start, x_end],
+        #     [I[i], I[i+1]],
+        #     [C[i], C[i+1]],
+        #     facecolor='none',
+        #     edgecolor=COLOR_INVERT,
+        #     alpha=0.3,
+        #     hatch='///',
+        #     zorder=3,
+        # )
     # HGL
     if any(s['hgl_dn'] is not None for s in S):
         for i, s in enumerate(S):
@@ -386,8 +387,8 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
         bl = 0 if r == 0 else r - hw
         ax.add_patch(patches.Rectangle(
             (bl, inv), sw, grd - inv,
-            lw=1.2, ec=COLOR_STRUCTURE, fc='none',
-            hatch='///', alpha=0.4, zorder=7,
+            lw=1.2, ec=COLOR_STRUCTURE, fc='none', zorder=7,
+            # hatch='///', alpha=0.4,  # structure box hatch (disabled)
         ))
         sq = (emax - emin) * 0.012
         ax.add_patch(patches.Rectangle((bl + hw*0.2, inv), sw*0.6, sq, lw=0.5, ec=COLOR_STRUCTURE, fc=COLOR_STRUCTURE, zorder=8))
