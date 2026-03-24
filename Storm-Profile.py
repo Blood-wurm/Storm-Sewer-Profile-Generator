@@ -510,7 +510,7 @@ def plot_profile(profile, project_name='', return_period='', ax=None):
             # hatch='///', alpha=0.4,  # structure box hatch (disabled)
         ))
         sq = (emax - emin) * 0.012
-        ax.add_patch(patches.Rectangle((bl + hw*0.2, inv), sw*0.6, sq, lw=0.5, ec=COLOR_STRUCTURE, fc=COLOR_STRUCTURE, zorder=8, clip_on=False))
+        ax.add_patch(patches.Rectangle((bl, inv - sq), sw, sq, lw=0.5, ec=COLOR_STRUCTURE, fc=COLOR_STRUCTURE, zorder=8, clip_on=False))
     # Error annotation
     errors = []
     for i in range(nn):
@@ -795,12 +795,12 @@ def _add_highlight_rect(page, x1, y1, x2, y2):
             FloatObject(x2), FloatObject(y2),
         ]),
         NameObject("/IC"): ArrayObject([
-            FloatObject(1.0), FloatObject(0.85), FloatObject(0.85),
+            FloatObject(0.929), FloatObject(0.631), FloatObject(0.631),
         ]),
         NameObject("/C"): ArrayObject([
             FloatObject(1.0), FloatObject(0.0), FloatObject(0.0),
         ]),
-        NameObject("/CA"): FloatObject(0.3),
+        NameObject("/CA"): FloatObject(0.4),
         NameObject("/BS"): DictionaryObject({
             NameObject("/Type"): NameObject("/Border"),
             NameObject("/W"): FloatObject(0),
@@ -863,7 +863,7 @@ def _create_check_summary_pages(all_failures):
         ax.text(0.99, 0.01, 'Storm Sewer Profile Generator',
                 transform=ax.transAxes, ha='right', va='bottom',
                 fontsize=7, color='#999999')
-        fig.subplots_adjust(left=0.05, right=0.98, top=0.92, bottom=0.05)
+        fig.subplots_adjust(left=0.05, right=0.98, top=1.0, bottom=0.05)
         figures.append(fig)
         return figures
 
@@ -892,7 +892,7 @@ def _create_check_summary_pages(all_failures):
                 transform=ax.transAxes, ha='left', va='top',
                 fontsize=14, fontweight='bold')
         count_text = f'{len(all_failures)} line{"s" if len(all_failures) != 1 else ""} exceed capacity'
-        ax.text(0.0, 0.955, count_text, transform=ax.transAxes, ha='left', va='top',
+        ax.text(0.0, 0.97, count_text, transform=ax.transAxes, ha='left', va='top',
                 fontsize=10, color='#CC0000')
 
         tbl = ax.table(
@@ -912,11 +912,11 @@ def _create_check_summary_pages(all_failures):
             idx = start + i
             ratio = all_failures[idx]['total_flow'] / all_failures[idx]['capacity'] if all_failures[idx]['capacity'] > 0 else float('inf')
             if ratio >= 1.5:
-                bg = '#FFCCCC'
+                bg = '#FFFFFF'
             elif ratio >= 1.2:
-                bg = '#FFE0CC'
+                bg = '#FFFFFF'
             else:
-                bg = '#FFFFCC'
+                bg = '#FFFFFF'
             for j in range(len(col_labels)):
                 tbl[i + 1, j].set_facecolor(bg)
 
