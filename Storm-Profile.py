@@ -299,7 +299,7 @@ def parse_dot_pdf(filepath):
                 rp = re.search(r'Return period\s*=\s*(\d+)\s*Yrs', raw_line)
                 if rp:
                     page_rp = int(rp.group(1))
-                pf = re.search(r'Project File:\s*(.*?\.stm)', raw_line)
+                pf = re.search(r'Project [Ff]ile:\s*(.*?\.stm)', raw_line)
                 if pf and not project_file:
                     project_file = os.path.splitext(pf.group(1).strip())[0]
 
@@ -362,7 +362,7 @@ def parse_other_report_pdf(filepath):
                 rp = re.search(r'Return period\s*=\s*(\d+)\s*Yrs', raw_line)
                 if rp:
                     page_rp = int(rp.group(1))
-                pf = re.search(r'Project File:\s*(.*?\.stm)', raw_line)
+                pf = re.search(r'Project [Ff]ile:\s*(.*?\.stm)', raw_line)
                 if pf and not project_file:
                     project_file = os.path.splitext(pf.group(1).strip())[0]
 
@@ -387,6 +387,40 @@ def parse_other_report_pdf(filepath):
             r['project_file'] = project_file
 
     return results
+
+def parse_plan_view_pdf(filepath):
+    """Parse a Hydraflow plan view PDF.
+    Identifies plan view pages by 'Plan View' in the page text header.
+    Extracts project file from footer using the same pattern as DOT parser.
+    Returns a dict with project_file, path, pages, or None if not a plan view."""
+    project_file = None
+    pages = []
+
+    with pdfplumber.open(filepath) as pdf:
+        for page_idx, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if not text:
+                continue
+
+            # Check for Plan View identifier in header
+            is_plan = False
+            for raw_line in text.split('\n'):
+                if re.search(r'Plan\s*View', raw_line, re.IGNORECASE):
+                    is_plan = True
+                pf = re.search(r'Project [Ff]ile:\s*(.*?\.stm)', raw_line)
+                if pf and not project_file:
+                    project_file = os.path.splitext(pf.group(1).strip())[0]
+
+            if is_plan:
+                pages.append(page_idx)
+
+    if not pages:
+        return None
+
+    return {
+        'project_file': project_file,
+        'pages': pages,
+    }
 
 def parse_report_pdf(filepath):
     """Parse custom report PDF (legacy). Returns dict keyed by Line No."""
@@ -700,12 +734,13 @@ def plot_plan_view(lines, project_name=''):
 # =============================================================================
 
 def classify_files(file_paths):
-    stm_files = {}; dot_files = []; other_files = []
+    stm_files = {}; dot_files = []; other_files = []; plan_files = []
     for fp in file_paths:
         ext = os.path.splitext(fp)[1].lower()
         if ext == '.stm':
             stm_files[os.path.splitext(os.path.basename(fp))[0]] = fp
         elif ext == '.pdf':
+            # Try DOT first
             entries = parse_dot_pdf(fp)
             is_dot = False
             for info in entries:
@@ -714,15 +749,21 @@ def classify_files(file_paths):
                     print(f"  DOT: {os.path.basename(fp)} -> {info['project_file']} / {info['return_period']} ({len(info['data'])} lines)")
                     is_dot = True
             if not is_dot:
-                # Try as other report (non-DOT)
-                other_entries = parse_other_report_pdf(fp)
-                for info in other_entries:
-                    if info['project_file'] and info['return_period']:
-                        other_files.append({**info, 'path': fp})
-                        print(f"  Report: {os.path.basename(fp)} -> {info['project_file']} / {info['return_period']} ({len(info['pages'])} pages)")
-                if not other_entries:
-                    print(f"  Skipped: {os.path.basename(fp)} (no DOT tabulations or report data found)")
-    return stm_files, dot_files, other_files
+                # Try as plan view
+                plan_info = parse_plan_view_pdf(fp)
+                if plan_info and plan_info['project_file']:
+                    plan_files.append({**plan_info, 'path': fp})
+                    print(f"  Plan View: {os.path.basename(fp)} -> {plan_info['project_file']} ({len(plan_info['pages'])} pages)")
+                else:
+                    # Try as other report (non-DOT)
+                    other_entries = parse_other_report_pdf(fp)
+                    for info in other_entries:
+                        if info['project_file'] and info['return_period']:
+                            other_files.append({**info, 'path': fp})
+                            print(f"  Report: {os.path.basename(fp)} -> {info['project_file']} / {info['return_period']} ({len(info['pages'])} pages)")
+                    if not other_entries:
+                        print(f"  Skipped: {os.path.basename(fp)} (no DOT tabulations, plan view, or report data found)")
+    return stm_files, dot_files, other_files, plan_files
 
 def _fig_to_temp_pdf(fig, prefix='temp'):
     fd, path = tempfile.mkstemp(suffix='.pdf', prefix=f'ssp_{prefix}_')
@@ -737,7 +778,19 @@ def _append_pdf(writer, path, page_nums=None):
     else:
         for pn in page_nums: writer.add_page(reader.pages[pn])
 
-def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf', other_files=None):
+def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf',
+                         other_files=None, plan_files=None, missing_plan_cb=None):
+    """Generate the full deliverable PDF.
+    
+    Args:
+        stm_files: dict of {system_name: stm_path}
+        dot_files: list of DOT report dicts
+        output_path: output PDF path
+        other_files: list of other report dicts (optional)
+        plan_files: list of plan view dicts (optional)
+        missing_plan_cb: callback(system_name) -> bool; called when a system has
+                         no Hydraflow plan view. Return True to continue, False to abort.
+    """
     writer = PdfWriter()
     dot_by_proj = defaultdict(list)
     for d in dot_files: dot_by_proj[d['project_file']].append(d)
@@ -748,6 +801,11 @@ def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf', ot
         for o in other_files:
             key = (o['project_file'], o['return_period_num'])
             other_by_proj_rp[key].append(o)
+    # Group plan views by project file
+    plan_by_proj = {}
+    if plan_files:
+        for pv in plan_files:
+            plan_by_proj[pv['project_file']] = pv
     systems = []
     for sn, sp in sorted(stm_files.items()):
         systems.append((sn, sp, dot_by_proj.get(sn, [])))
@@ -760,11 +818,19 @@ def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf', ot
         print(f"  {len(lines)} lines")
         pgroups = group_paths_by_prefix(lines)
         print(f"  Designations: {sorted(pgroups.keys())}")
-        # Plan view
-        fig = plot_plan_view(lines, sn)
-        tp = _fig_to_temp_pdf(fig, 'plan'); plt.close(fig)
-        _append_pdf(writer, tp); os.unlink(tp); pc += 1
-        print(f"  Page {pc}: Plan view")
+        # Plan view — use Hydraflow plan view if available
+        if sn in plan_by_proj:
+            pv = plan_by_proj[sn]
+            reader = PdfReader(pv['path'])
+            for pg_idx in pv['pages']:
+                writer.add_page(reader.pages[pg_idx]); pc += 1
+                print(f"  Page {pc}: Plan view (Hydraflow)")
+        else:
+            print(f"  WARNING: No Hydraflow plan view found for {sn}")
+            if missing_plan_cb:
+                if not missing_plan_cb(sn):
+                    print("  Aborted by user."); return
+            # No plan view included for this system
         if dots:
             for di in dots:
                 rl = di['return_period']; rd = di['data']; dp = di['path']
@@ -1134,9 +1200,12 @@ def main():
     if args.gui or (args.stm is None and not args.files and not args.report):
         launch_gui(); return
     if args.files:
-        sf, df, of = classify_files(args.files)
+        sf, df, of, pf = classify_files(args.files)
         if not sf: print("ERROR: No .stm files."); return
-        generate_deliverable(sf, df, args.output, of); return
+        def _cli_missing_plan(sn):
+            resp = input(f"WARNING: No Hydraflow plan view for '{sn}'. Continue? [y/N] ")
+            return resp.strip().lower() in ('y', 'yes')
+        generate_deliverable(sf, df, args.output, of, pf, missing_plan_cb=_cli_missing_plan); return
     if not args.stm: parser.error('Provide .stm or --files')
     rp = {}
     for r in args.report:
@@ -1221,9 +1290,23 @@ def launch_gui():
         def dw():
             try:
                 print("Classifying files...")
-                sf,df,of=classify_files(file_list)
+                sf,df,of,pf=classify_files(file_list)
                 if not sf: root.after(0,lambda:messagebox.showerror("Error","No .stm files found.")); return
-                generate_deliverable(sf,df,op,of)
+                # Callback for missing plan views — runs on main thread via Event
+                import threading as _thr
+                _result = [None]
+                _event = _thr.Event()
+                def _ask_plan(sn):
+                    def _do():
+                        _result[0] = messagebox.askyesno(
+                            "Missing Plan View",
+                            f"No Hydraflow plan view found for system '{sn}'.\n\n"
+                            "Continue without a plan view for this system?")
+                        _event.set()
+                    root.after(0, _do)
+                    _event.wait(); _event.clear()
+                    return _result[0]
+                generate_deliverable(sf,df,op,of,pf,missing_plan_cb=_ask_plan)
                 root.after(0,lambda:messagebox.showinfo("Complete",f"Saved to:\n{op}"))
             except Exception as e:
                 root.after(0,lambda:messagebox.showerror("Error",str(e)))
@@ -1266,7 +1349,7 @@ def launch_gui():
         def dw():
             try:
                 print("Classifying files...")
-                _,df,of=classify_files(pdfs)
+                _,df,of,_pf=classify_files(pdfs)
                 if not df and not of: root.after(0,lambda:messagebox.showerror("Error","No report data found in PDFs.")); return
                 compile_reports(df,op,of)
                 root.after(0,lambda:messagebox.showinfo("Complete",f"Saved to:\n{op}"))
