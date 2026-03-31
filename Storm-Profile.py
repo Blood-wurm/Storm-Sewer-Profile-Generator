@@ -342,19 +342,27 @@ def parse_dot_pdf(filepath):
     return results
 
 def parse_other_report_pdf(filepath):
-    """Parse a non-DOT report PDF for project file and return period.
+    """Parse a non-DOT report PDF for project file, return period, and report type.
     Uses the same footer patterns as parse_dot_pdf (Project File / Return period).
+    Extracts report type from the first line of text on the first matched page.
     Returns a LIST of dicts, one per return period found.
-    Each dict has: project_file, return_period, return_period_num, pages."""
+    Each dict has: project_file, return_period, return_period_num, report_type, pages."""
     results = []
     current = None
     project_file = None
+    report_type = None
 
     with pdfplumber.open(filepath) as pdf:
         for page_idx, page in enumerate(pdf.pages):
             text = page.extract_text()
             if not text:
                 continue
+
+            # Extract report type from the first line (header) on the first page
+            if report_type is None:
+                first_line = text.split('\n')[0].strip()
+                if first_line:
+                    report_type = first_line
 
             # Look for return period and project file using same patterns as DOT
             page_rp = None
@@ -372,6 +380,7 @@ def parse_other_report_pdf(filepath):
                     'project_file': project_file,
                     'return_period': f"{page_rp} YEAR",
                     'return_period_num': page_rp,
+                    'report_type': report_type,
                     'pages': [],
                 }
                 results.append(current)
@@ -391,9 +400,10 @@ def parse_other_report_pdf(filepath):
 def parse_plan_view_pdf(filepath):
     """Parse a Hydraflow plan view PDF.
     Identifies plan view pages by 'Plan View' in the page text header.
-    Extracts project file from footer using the same pattern as DOT parser.
-    Returns a dict with project_file, path, pages, or None if not a plan view."""
+    Extracts project file and line count from footer.
+    Returns a dict with project_file, num_lines, path, pages, or None if not a plan view."""
     project_file = None
+    num_lines = None
     pages = []
 
     with pdfplumber.open(filepath) as pdf:
@@ -410,6 +420,9 @@ def parse_plan_view_pdf(filepath):
                 pf = re.search(r'Project [Ff]ile:\s*(.*?\.stm)', raw_line)
                 if pf and not project_file:
                     project_file = os.path.splitext(pf.group(1).strip())[0]
+                nl = re.search(r'No\.\s*Lines:\s*(\d+)', raw_line)
+                if nl and num_lines is None:
+                    num_lines = int(nl.group(1))
 
             if is_plan:
                 pages.append(page_idx)
@@ -419,6 +432,7 @@ def parse_plan_view_pdf(filepath):
 
     return {
         'project_file': project_file,
+        'num_lines': num_lines,
         'pages': pages,
     }
 
@@ -779,9 +793,10 @@ def _append_pdf(writer, path, page_nums=None):
         for pn in page_nums: writer.add_page(reader.pages[pn])
 
 def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf',
-                         other_files=None, plan_files=None, missing_plan_cb=None):
+                         other_files=None, plan_files=None,
+                         missing_plan_cb=None, warning_cb=None):
     """Generate the full deliverable PDF.
-    
+
     Args:
         stm_files: dict of {system_name: stm_path}
         dot_files: list of DOT report dicts
@@ -790,37 +805,97 @@ def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf',
         plan_files: list of plan view dicts (optional)
         missing_plan_cb: callback(system_name) -> bool; called when a system has
                          no Hydraflow plan view. Return True to continue, False to abort.
+        warning_cb: callback(message) -> bool; called for warnings (e.g. duplicate
+                    reports, plan view mismatch). Return True to continue, False to abort.
+
+    Returns:
+        True if the deliverable was written successfully, False if aborted.
     """
+    # Default warning_cb: print and continue
+    if warning_cb is None:
+        def warning_cb(msg):
+            print(f"  WARNING: {msg}")
+            return True
+
     writer = PdfWriter()
+
+    # --- Duplicate report detection ---
+    # Check DOT reports: keyed by (project_file, return_period_num)
+    dot_seen = {}
+    deduped_dot = []
+    for d in dot_files:
+        key = (d['project_file'], d['return_period_num'], 'Storm Sewer Tabulation')
+        if key in dot_seen:
+            msg = (f"Duplicate DOT report for {d['project_file']} / {d['return_period']}\n"
+                   f"  File 1: {os.path.basename(dot_seen[key])}\n"
+                   f"  File 2: {os.path.basename(d['path'])}\n"
+                   f"Skip the duplicate?")
+            if not warning_cb(msg):
+                print("  Aborted by user."); return False
+            # User chose to skip — don't add to deduped list
+            print(f"  Skipping duplicate: {os.path.basename(d['path'])} (DOT)")
+            continue
+        dot_seen[key] = d['path']
+        deduped_dot.append(d)
+    # Rebuild dot_by_proj from deduped list
     dot_by_proj = defaultdict(list)
-    for d in dot_files: dot_by_proj[d['project_file']].append(d)
+    for d in deduped_dot: dot_by_proj[d['project_file']].append(d)
     for pf in dot_by_proj: dot_by_proj[pf].sort(key=lambda x: x['return_period_num'])
-    # Group other reports by (project_file, return_period_num)
+
+    # Check other reports: keyed by (project_file, return_period_num, report_type)
     other_by_proj_rp = defaultdict(list)
+    other_seen = {}
     if other_files:
         for o in other_files:
-            key = (o['project_file'], o['return_period_num'])
-            other_by_proj_rp[key].append(o)
+            rt = o.get('report_type', 'Unknown')
+            key = (o['project_file'], o['return_period_num'], rt)
+            if key in other_seen:
+                msg = (f"Duplicate report: '{rt}' for {o['project_file']} / {o['return_period']}\n"
+                       f"  File 1: {os.path.basename(other_seen[key])}\n"
+                       f"  File 2: {os.path.basename(o['path'])}\n"
+                       f"Skip the duplicate?")
+                if not warning_cb(msg):
+                    print("  Aborted by user."); return False
+                # User chose to skip — don't add
+                print(f"  Skipping duplicate: {os.path.basename(o['path'])} ({rt})")
+                continue
+            other_seen[key] = o['path']
+            key2 = (o['project_file'], o['return_period_num'])
+            other_by_proj_rp[key2].append(o)
+
     # Group plan views by project file
     plan_by_proj = {}
     if plan_files:
         for pv in plan_files:
             plan_by_proj[pv['project_file']] = pv
+
     systems = []
     for sn, sp in sorted(stm_files.items()):
         systems.append((sn, sp, dot_by_proj.get(sn, [])))
     if not systems:
-        print("ERROR: No systems to process."); return
+        print("ERROR: No systems to process."); return False
+
     pc = 0
     for sn, sp, dots in systems:
         print(f"\n{'='*60}\nSystem: {sn}\n{'='*60}")
         header, lines = parse_stm(sp)
-        print(f"  {len(lines)} lines")
+        stm_line_count = len(lines)
+        print(f"  {stm_line_count} lines")
         pgroups = group_paths_by_prefix(lines)
         print(f"  Designations: {sorted(pgroups.keys())}")
+
         # Plan view — use Hydraflow plan view if available
         if sn in plan_by_proj:
             pv = plan_by_proj[sn]
+            # Validate line count against STM
+            pv_lines = pv.get('num_lines')
+            if pv_lines is not None and pv_lines != stm_line_count:
+                msg = (f"Plan view line count mismatch for {sn}:\n"
+                       f"  Hydraflow plan view: {pv_lines} lines\n"
+                       f"  STM file: {stm_line_count} lines\n"
+                       f"Continue anyway?")
+                if not warning_cb(msg):
+                    print("  Aborted by user."); return False
             reader = PdfReader(pv['path'])
             for pg_idx in pv['pages']:
                 writer.add_page(reader.pages[pg_idx]); pc += 1
@@ -829,8 +904,9 @@ def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf',
             print(f"  WARNING: No Hydraflow plan view found for {sn}")
             if missing_plan_cb:
                 if not missing_plan_cb(sn):
-                    print("  Aborted by user."); return
+                    print("  Aborted by user."); return False
             # No plan view included for this system
+
         if dots:
             for di in dots:
                 rl = di['return_period']; rd = di['data']; dp = di['path']
@@ -863,8 +939,10 @@ def generate_deliverable(stm_files, dot_files, output_path='deliverable.pdf',
                 tp = _fig_to_temp_pdf(fig, f'p_{pfx}'); plt.close(fig)
                 _append_pdf(writer, tp); os.unlink(tp); pc += 1
                 print(f"  Page {pc}: {pfx} (geometry only)")
+
     with open(output_path, 'wb') as f: writer.write(f)
     print(f"\nDone! {pc} pages written to {output_path}")
+    return True
 
 def compile_reports(dot_files, output_path='reports.pdf', other_files=None):
     """Compile report PDFs only (no STM/profiles required).
@@ -1043,13 +1121,13 @@ def _create_check_summary_pages(all_failures):
     if not all_failures:
         fig, ax = plt.subplots(figsize=(11, 8.5))
         ax.axis('off')
-        ax.text(0.5, 0.55, 'System Check \u2014 Capacity Exceedance Summary',
+        ax.text(0.5, 0.55, 'System Check \u2014 Summary',
                 transform=ax.transAxes, ha='center', va='center',
                 fontsize=16, fontweight='bold')
-        ax.text(0.5, 0.45, 'All lines OK \u2014 no capacity exceedances found.',
+        ax.text(0.5, 0.45, 'All lines OK \u2014 No lines exceed capacity.',
                 transform=ax.transAxes, ha='center', va='center',
                 fontsize=14, color='#228B22')
-        ax.text(0.99, 0.01, 'Storm Sewer Profile Generator',
+        ax.text(0.99, 0.01, 'Capacity check',
                 transform=ax.transAxes, ha='right', va='bottom',
                 fontsize=7, color='#999999')
         fig.subplots_adjust(left=0.05, right=0.98, top=1.0, bottom=0.05)
@@ -1077,7 +1155,7 @@ def _create_check_summary_pages(all_failures):
         page_rows = all_rows[start:end]
 
         page_label = f'  (Page {pg+1} of {n_pages})' if n_pages > 1 else ''
-        ax.text(0.0, 1.0, f'System Check \u2014 Capacity Exceedance Summary{page_label}',
+        ax.text(0.0, 1.0, f'System Check \u2014 Summary{page_label}',
                 transform=ax.transAxes, ha='left', va='top',
                 fontsize=14, fontweight='bold')
         count_text = f'{len(all_failures)} line{"s" if len(all_failures) != 1 else ""} exceed capacity'
@@ -1109,60 +1187,77 @@ def _create_check_summary_pages(all_failures):
             for j in range(len(col_labels)):
                 tbl[i + 1, j].set_facecolor(bg)
 
-        ax.text(0.99, 0.005, 'Storm Sewer Profile Generator',
+        ax.text(0.99, 0.005, 'System Capacity Check',
                 transform=ax.transAxes, ha='right', va='bottom',
                 fontsize=7, color='#999999')
         fig.subplots_adjust(left=0.05, right=0.98, top=0.92, bottom=0.03)
         figures.append(fig)
 
     return figures
-
+    
 def generate_system_check(dot_paths, output_path='system_check.pdf'):
     """Generate a system check PDF highlighting lines where Total Flow > Capacity.
-    Produces a summary page followed by annotated copies of all DOT pages."""
+    Produces a summary page followed by annotated copies of all DOT pages,
+    sorted by system name then return period."""
     writer = PdfWriter()
     all_failures = []
 
-    for fp in dot_paths:
-        print(f"\nChecking: {os.path.basename(fp)}")
-        entries = parse_dot_pdf(fp)
-        if not entries:
-            print(f"  No DOT tabulations found — skipped")
-            continue
-        for entry in entries:
-            rp = entry['return_period']
-            pf = entry['project_file'] or os.path.splitext(os.path.basename(fp))[0]
-            data = entry['data']
-            dot_pages = entry['dot_pages']
-            # Identify failing lines
-            failing_lines = set()
-            for ln, d in data.items():
-                tf = d.get('Total Flow')
-                cap = d.get('Capacity')
-                if tf is not None and cap is not None and tf > cap:
-                    failing_lines.add(ln)
-                    all_failures.append({
-                        'file': pf, 'return_period': rp,
-                        'line_no': ln, 'line_id': d.get('Line ID', ''),
-                        'total_flow': tf, 'capacity': cap,
-                    })
-            n_fail = len(failing_lines)
-            n_total = len(data)
-            print(f"  {rp}: {n_fail} of {n_total} lines exceed capacity")
-            # Copy DOT pages and overlay highlights
-            with pdfplumber.open(fp) as plumber_pdf:
-                reader = PdfReader(fp)
-                for page_idx in dot_pages:
-                    writer.add_page(reader.pages[page_idx])
-                    if failing_lines:
-                        _highlight_dot_rows(
-                            writer.pages[-1],
-                            plumber_pdf.pages[page_idx],
-                            failing_lines,
-                        )
+    # Parse and classify all PDFs, then sort by system name and return period
+    print("Classifying files...")
+    _, dot_files, _, _ = classify_files(dot_paths)
+    if not dot_files:
+        print("No DOT tabulations found in any of the provided files.")
+        return
 
-    # Build summary page(s)
-    all_failures.sort(key=lambda x: (x['file'], x['return_period'], x['line_no']))
+    dot_files.sort(key=lambda e: (
+        (e['project_file'] or '').lower(),
+        e['return_period_num'],
+    ))
+
+    # Group entries by source PDF path so each file is only opened once
+    entries_by_path = defaultdict(list)
+    for entry in dot_files:
+        entries_by_path[entry['path']].append(entry)
+
+    for entry in dot_files:
+        pf = entry['project_file'] or os.path.splitext(os.path.basename(entry['path']))[0]
+        rp = entry['return_period']
+        data = entry['data']
+        dot_pages = entry['dot_pages']
+        fp = entry['path']
+
+        print(f"\n{pf} — {rp}")
+
+        # Identify failing lines
+        failing_lines = set()
+        for ln, d in data.items():
+            tf = d.get('Total Flow')
+            cap = d.get('Capacity')
+            if tf is not None and cap is not None and tf > cap:
+                failing_lines.add(ln)
+                all_failures.append({
+                    'file': pf, 'return_period': rp,
+                    'line_no': ln, 'line_id': d.get('Line ID', ''),
+                    'total_flow': tf, 'capacity': cap,
+                })
+
+        n_fail = len(failing_lines)
+        n_total = len(data)
+        print(f"  {n_fail} of {n_total} lines exceed capacity")
+
+        # Copy DOT pages and overlay highlights
+        with pdfplumber.open(fp) as plumber_pdf:
+            reader = PdfReader(fp)
+            for page_idx in dot_pages:
+                writer.add_page(reader.pages[page_idx])
+                if failing_lines:
+                    _highlight_dot_rows(
+                        writer.pages[-1],
+                        plumber_pdf.pages[page_idx],
+                        failing_lines,
+                    )
+
+    # Build summary page(s) — failures are already in sorted order
     summary_figs = _create_check_summary_pages(all_failures)
 
     # Insert summary at front of output
@@ -1205,7 +1300,16 @@ def main():
         def _cli_missing_plan(sn):
             resp = input(f"WARNING: No Hydraflow plan view for '{sn}'. Continue? [y/N] ")
             return resp.strip().lower() in ('y', 'yes')
-        generate_deliverable(sf, df, args.output, of, pf, missing_plan_cb=_cli_missing_plan); return
+        def _cli_warning(msg):
+            resp = input(f"WARNING: {msg} [y/N] ")
+            return resp.strip().lower() in ('y', 'yes')
+        success = generate_deliverable(
+            sf, df, args.output, of, pf,
+            missing_plan_cb=_cli_missing_plan,
+            warning_cb=_cli_warning)
+        if not success:
+            print("Generation cancelled.")
+        return
     if not args.stm: parser.error('Provide .stm or --files')
     rp = {}
     for r in args.report:
@@ -1219,147 +1323,573 @@ def main():
 # =============================================================================
 
 def launch_gui():
-    import tkinter as tk
+    import customtkinter as ctk
     from tkinter import filedialog, messagebox
+    from tkinterdnd2 import TkinterDnD, DND_FILES
     import threading
-    root = tk.Tk(); root.title("Storm Sewer Profile Generator")
-    root.geometry("720x580"); root.minsize(620, 480)
-    BG="#f5f5f5"; FBG="#ffffff"; AC="#2a5d9f"; BBG="#2a5d9f"; BFG="#ffffff"
-    FN=("Segoe UI",10); FS=("Segoe UI",9); FL=("Segoe UI",10,"bold"); FM=("Consolas",9)
-    root.configure(bg=BG); file_list=[]
-    class LR:
-        def __init__(s,w): s.w=w
-        def write(s,t): s.w.configure(state='normal'); s.w.insert(tk.END,t); s.w.see(tk.END); s.w.configure(state='disabled')
-        def flush(s): pass
-    tf=tk.Frame(root,bg=AC,height=44); tf.pack(fill='x'); tf.pack_propagate(False)
-    tk.Label(tf,text="Storm Sewer Profile Generator",font=("Segoe UI",14,"bold"),fg="white",bg=AC).pack(side='left',padx=14,pady=8)
-    ct=tk.Frame(root,bg=BG,padx=14,pady=10); ct.pack(fill='both',expand=True)
-    tk.Label(ct,text="Project Files (.stm and DOT PDFs):",font=FL,bg=BG,anchor='w').pack(fill='x',pady=(0,2))
-    ff=tk.Frame(ct,bg=FBG,relief='sunken',bd=1); ff.pack(fill='x',pady=(0,4))
-    fl=tk.Listbox(ff,font=FS,height=6,selectmode='extended',bg=FBG,bd=0)
-    fsc=tk.Scrollbar(ff,command=fl.yview); fl.configure(yscrollcommand=fsc.set)
-    fsc.pack(side='right',fill='y'); fl.pack(fill='both',expand=True,padx=2,pady=2)
-    bf=tk.Frame(ct,bg=BG); bf.pack(fill='x',pady=(0,6))
-    ov=tk.StringVar()
-    def af():
-        ps=filedialog.askopenfilenames(title="Select Files",filetypes=[("Hydraflow","*.stm *.pdf"),("All","*.*")])
-        for p in ps:
-            if p not in file_list:
-                file_list.append(p); e=os.path.splitext(p)[1].lower()
-                fl.insert(tk.END,f"  {'[STM]' if e=='.stm' else '[PDF]'}  {os.path.basename(p)}")
-        if not ov.get():
-            for p in file_list:
-                if p.lower().endswith('.stm'):
-                    ov.set(os.path.join(os.path.dirname(p),'deliverable.pdf')); break
-    def rf():
-        for i in sorted(fl.curselection(),reverse=True): fl.delete(i); file_list.pop(i)
-    def cf(): fl.delete(0,tk.END); file_list.clear()
-    tk.Button(bf,text="Add Files...",font=FS,command=af,padx=8).pack(side='left',padx=(0,6))
-    tk.Button(bf,text="Remove",font=FS,command=rf,padx=8).pack(side='left',padx=(0,6))
-    tk.Button(bf,text="Clear",font=FS,command=cf,padx=8).pack(side='left')
-    ro=tk.Frame(ct,bg=BG); ro.pack(fill='x',pady=(6,6))
-    tk.Label(ro,text="Output PDF:",font=FL,bg=BG,width=12,anchor='w').pack(side='left')
-    oe=tk.Entry(ro,textvariable=ov,font=FN); oe.pack(side='left',fill='x',expand=True,padx=(0,6))
-    def bo():
-        p=filedialog.asksaveasfilename(title="Save As",defaultextension=".pdf",filetypes=[("PDF","*.pdf")])
-        if p: ov.set(p)
-    tk.Button(ro,text="Browse...",font=FS,command=bo,padx=10).pack(side='left')
-    bfr=tk.Frame(ct,bg=BG); bfr.pack(fill='x',pady=(8,6))
-    gb=tk.Button(bfr,text="Generate Storm-Sewer Profiles",font=("Segoe UI",11,"bold"),bg=BBG,fg=BFG,activebackground="#1e4a80",activeforeground="white",padx=20,pady=6,cursor="hand2")
-    gb.pack(side='left',expand=True)
-    CRB="#2a7d4f"; CRA="#1e5d3a"
-    cb=tk.Button(bfr,text="Compile Reports",font=("Segoe UI",11,"bold"),bg=CRB,fg=BFG,activebackground=CRA,activeforeground="white",padx=20,pady=6,cursor="hand2")
-    cb.pack(side='left',expand=True,padx=(10,0))
-    SCB="#8B0000"; SCA="#6B0000"
-    sb=tk.Button(bfr,text="System Check",font=("Segoe UI",11,"bold"),bg=SCB,fg=BFG,activebackground=SCA,activeforeground="white",padx=20,pady=6,cursor="hand2")
-    sb.pack(side='left',expand=True,padx=(10,0))
-    tk.Label(ct,text="Log:",font=FL,bg=BG,anchor='w').pack(fill='x',pady=(8,2))
-    lf=tk.Frame(ct,bg=FBG,relief='sunken',bd=1); lf.pack(fill='both',expand=True)
-    lt=tk.Text(lf,font=FM,wrap='word',state='disabled',bg=FBG,bd=0,padx=6,pady=4)
-    ls=tk.Scrollbar(lf,command=lt.yview); lt.configure(yscrollcommand=ls.set)
-    ls.pack(side='right',fill='y'); lt.pack(fill='both',expand=True)
-    def rg():
-        if not file_list: messagebox.showwarning("No Files","Add .stm and DOT PDF files."); return
-        op=ov.get().strip()
-        if not op: messagebox.showwarning("No Output","Specify output path."); return
+    import re as _re
+
+    # Subclass that wires TkinterDnD into the CustomTkinter window
+    class DnDCTk(ctk.CTk, TkinterDnD.DnDWrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.TkdndVersion = TkinterDnD._require(self)
+
+    # -------------------------------------------------------------------------
+    # Constants
+    # -------------------------------------------------------------------------
+    SIDEBAR_BG      = "#152641"
+    SIDEBAR_WIDTH   = 195
+    NAV_ACTIVE_BG   = "#223d63"
+    NAV_FG_MUTED    = "#7a9abf"
+    NAV_FG_ACTIVE   = "#ffffff"
+    COLOR_GENERATE  = "#1a3a6b"
+    COLOR_COMPILE   = "#1e5d3a"
+    COLOR_CHECK     = "#7c2020"
+    FONT_NAV        = ("Segoe UI", 12)
+    FONT_LABEL      = ("Segoe UI", 10, "bold")
+    FONT_BODY       = ("Segoe UI", 10)
+    FONT_MONO       = ("Consolas", 9)
+
+    # -------------------------------------------------------------------------
+    # App setup
+    # -------------------------------------------------------------------------
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("dark-blue")
+
+    root = DnDCTk()
+    root.title("Storm Sewer Profile Generator")
+    root.geometry("860x640")
+    root.minsize(720, 520)
+
+    # Two columns: sidebar | main
+    root.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_WIDTH)
+    root.grid_columnconfigure(1, weight=1)
+    root.grid_rowconfigure(0, weight=1)
+
+    # -------------------------------------------------------------------------
+    # Log redirector — routes print() output to a CTkTextbox
+    # -------------------------------------------------------------------------
+    class LogRedirector:
+        def __init__(self, widget):
+            self.widget = widget
+
+        def write(self, text):
+            self.widget.configure(state="normal")
+            self.widget.insert("end", text)
+            self.widget.see("end")
+            self.widget.configure(state="disabled")
+
+        def flush(self):
+            pass
+
+    # =========================================================================
+    # SIDEBAR
+    # =========================================================================
+    sidebar = ctk.CTkFrame(root, fg_color=SIDEBAR_BG, corner_radius=0, width=SIDEBAR_WIDTH)
+    sidebar.grid(row=0, column=0, sticky="nsew")
+    sidebar.grid_propagate(False)
+    sidebar.grid_columnconfigure(0, weight=1)
+    sidebar.grid_rowconfigure(6, weight=1)  # pushes bottom items down
+
+    # App title
+    title_outer = ctk.CTkFrame(sidebar, fg_color="transparent")
+    title_outer.grid(row=0, column=0, sticky="ew", padx=16, pady=(20, 16))
+
+    ctk.CTkLabel(
+        title_outer,
+        text="Storm Sewer\nProfile Generator",
+        font=("Segoe UI", 13, "bold"),
+        text_color="#ffffff",
+        justify="left",
+        anchor="w",
+    ).pack(anchor="w")
+
+    ctk.CTkLabel(
+        title_outer,
+        text="v2.0",
+        font=("Segoe UI", 10),
+        text_color="#4a6a8a",
+        justify="left",
+        anchor="w",
+    ).pack(anchor="w")
+
+    # Divider
+    ctk.CTkFrame(sidebar, fg_color="#243f63", height=1, corner_radius=0).grid(
+        row=1, column=0, sticky="ew"
+    )
+
+    # Section label
+    ctk.CTkLabel(
+        sidebar,
+        text="WORKSPACE",
+        font=("Segoe UI", 9),
+        text_color="#3a5a7a",
+        anchor="w",
+    ).grid(row=2, column=0, sticky="ew", padx=16, pady=(14, 4))
+
+    # Nav buttons
+    NAV_ITEMS = [
+        ("Generate",            "generate"),
+        ("Compile Reports",     "compile"),
+        ("Line Capacity Check", "check"),
+    ]
+    nav_buttons = {}
+    pages       = {}
+
+    def switch_page(page_id):
+        for pid, btn in nav_buttons.items():
+            if pid == page_id:
+                btn.configure(fg_color=NAV_ACTIVE_BG, text_color=NAV_FG_ACTIVE)
+            else:
+                btn.configure(fg_color="transparent", text_color=NAV_FG_MUTED)
+        for pid, frame in pages.items():
+            if pid == page_id:
+                frame.grid()
+            else:
+                frame.grid_remove()
+
+    for row_idx, (label, page_id) in enumerate(NAV_ITEMS):
+        btn = ctk.CTkButton(
+            sidebar,
+            text=label,
+            font=FONT_NAV,
+            fg_color="transparent",
+            text_color=NAV_FG_MUTED,
+            hover_color="#1e3a5f",
+            anchor="w",
+            height=38,
+            corner_radius=6,
+            command=lambda pid=page_id: switch_page(pid),
+        )
+        btn.grid(row=3 + row_idx, column=0, sticky="ew", padx=8, pady=2)
+        nav_buttons[page_id] = btn
+
+    # =========================================================================
+    # MAIN AREA
+    # =========================================================================
+    main_area = ctk.CTkFrame(root, fg_color="transparent", corner_radius=0)
+    main_area.grid(row=0, column=1, sticky="nsew")
+    main_area.grid_rowconfigure(0, weight=1)
+    main_area.grid_columnconfigure(0, weight=1)
+
+    # -------------------------------------------------------------------------
+    # Helper: darken a hex color for hover states
+    # -------------------------------------------------------------------------
+    def _darken(hex_color):
+        h = hex_color.lstrip("#")
+        r, g, b = (int(h[i:i+2], 16) for i in (0, 2, 4))
+        return "#{:02x}{:02x}{:02x}".format(
+            max(0, int(r * 0.80)),
+            max(0, int(g * 0.80)),
+            max(0, int(b * 0.80)),
+        )
+
+    # -------------------------------------------------------------------------
+    # Helper: build a standard page
+    #   Returns (page_frame, file_list, output_var, log_widget, action_btn)
+    # -------------------------------------------------------------------------
+    def build_page(parent, action_label, action_color, action_fn, default_output_name,
+                   accepted_extensions=None, sort_alpha=False):
+
+        file_list  = []
+
+        # -- Outer frame --
+        frame = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=2)  # files card  ~2/3
+        frame.grid_rowconfigure(2, weight=1)  # log card    ~1/3
+
+        # ---- Files card ----
+        files_card = ctk.CTkFrame(frame, corner_radius=10)
+        files_card.grid(row=0, column=0, sticky="nsew", padx=16, pady=(16, 6))
+        files_card.grid_columnconfigure(0, weight=1)
+        files_card.grid_rowconfigure(1, weight=1)
+
+        # Card header row
+        card_header = ctk.CTkFrame(files_card, fg_color="transparent")
+        card_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        card_header.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            card_header,
+            text="PROJECT FILES",
+            font=("Segoe UI", 10, "bold"),
+            text_color="gray",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        btn_frame = ctk.CTkFrame(card_header, fg_color="transparent")
+        btn_frame.grid(row=0, column=1, sticky="e")
+
+        # Scrollable file list — no fixed height, expands with card
+        file_scroll = ctk.CTkScrollableFrame(files_card, corner_radius=6)
+        file_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        file_scroll.grid_columnconfigure(0, weight=1)
+
+        # -- File row management --
+        def refresh_file_rows():
+            for widget in file_scroll.winfo_children():
+                widget.destroy()
+            for i, fp in enumerate(file_list):
+                is_stm     = fp.lower().endswith(".stm")
+                badge_text = "STM" if is_stm else "PDF"
+                badge_fg   = "#0c447c" if is_stm else "#633806"
+                badge_bg   = "#d6e8fb" if is_stm else "#faeeda"
+
+                row = ctk.CTkFrame(
+                    file_scroll,
+                    fg_color=("gray88", "gray22"),
+                    corner_radius=6,
+                    height=30,
+                )
+                row.grid(row=i, column=0, sticky="ew", pady=2, padx=2)
+                row.grid_columnconfigure(1, weight=1)
+                row.grid_propagate(False)
+
+                ctk.CTkLabel(
+                    row,
+                    text=badge_text,
+                    font=("Segoe UI", 9, "bold"),
+                    text_color=badge_fg,
+                    fg_color=badge_bg,
+                    corner_radius=4,
+                    width=34,
+                    height=18,
+                ).grid(row=0, column=0, padx=(6, 4), pady=6)
+
+                ctk.CTkLabel(
+                    row,
+                    text=os.path.basename(fp),
+                    font=FONT_BODY,
+                    anchor="w",
+                ).grid(row=0, column=1, sticky="ew", padx=2)
+
+                ctk.CTkButton(
+                    row,
+                    text="×",
+                    font=("Segoe UI", 13),
+                    width=24,
+                    height=24,
+                    fg_color="transparent",
+                    hover_color=("gray78", "gray32"),
+                    text_color="gray",
+                    corner_radius=4,
+                    command=lambda idx=i: _remove_file(idx),
+                ).grid(row=0, column=2, padx=(0, 4))
+
+        def _remove_file(idx):
+            if 0 <= idx < len(file_list):
+                file_list.pop(idx)
+                refresh_file_rows()
+
+        def _add_files():
+            paths = filedialog.askopenfilenames(
+                title="Select Files",
+                filetypes=[("Hydraflow files", "*.stm *.pdf"), ("All files", "*.*")],
+            )
+            for p in paths:
+                if accepted_extensions and os.path.splitext(p)[1].lower() not in accepted_extensions:
+                    continue
+                if p not in file_list:
+                    file_list.append(p)
+            if sort_alpha:
+                file_list.sort(key=lambda p: os.path.basename(p).lower())
+            refresh_file_rows()
+
+        def _clear_files():
+            file_list.clear()
+            refresh_file_rows()
+
+        def _on_drop(data):
+            # tkinterdnd2 wraps paths with spaces in {braces}; others are space-separated
+            paths = [a or b for a, b in _re.findall(r'\{([^}]+)\}|(\S+)', data)]
+            for p in paths:
+                if accepted_extensions and os.path.splitext(p)[1].lower() not in accepted_extensions:
+                    continue
+                if p not in file_list:
+                    file_list.append(p)
+            if sort_alpha:
+                file_list.sort(key=lambda p: os.path.basename(p).lower())
+            refresh_file_rows()
+
+        ctk.CTkButton(
+            btn_frame, text="Add files",
+            font=FONT_BODY, width=82, height=26,
+            command=_add_files,
+        ).grid(row=0, column=0, padx=(0, 4))
+
+        ctk.CTkButton(
+            btn_frame, text="Clear",
+            font=FONT_BODY, width=56, height=26,
+            fg_color="transparent", border_width=1,
+            command=_clear_files,
+        ).grid(row=0, column=1)
+
+        # ---- Action button ----
+        # Use a list so the lambda can reference the button after it is created.
+        btn_ref = [None]
+
+        def _on_action():
+            action_fn(file_list, default_output_name, log_widget, btn_ref[0])
+
+        action_btn = ctk.CTkButton(
+            frame,
+            text=action_label,
+            font=("Segoe UI", 12, "bold"),
+            fg_color=action_color,
+            hover_color=_darken(action_color),
+            height=42,
+            corner_radius=8,
+            command=_on_action,
+        )
+        action_btn.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
+        btn_ref[0] = action_btn
+
+        # ---- Log card ----
+        log_card = ctk.CTkFrame(frame, corner_radius=10)
+        log_card.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        log_card.grid_rowconfigure(1, weight=1)
+        log_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            log_card,
+            text="LOG",
+            font=("Segoe UI", 10, "bold"),
+            text_color="gray",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+
+        log_widget = ctk.CTkTextbox(
+            log_card,
+            font=FONT_MONO,
+            state="disabled",
+            wrap="word",
+            corner_radius=6,
+        )
+        log_widget.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+        return frame, file_list, log_widget, action_btn, _on_drop
+
+    # =========================================================================
+    # PAGE RUNNERS
+    # =========================================================================
+
+    # ---- Generate profiles ----
+    def run_generate(file_list, default_output_name, log_widget, action_btn):
+        if not file_list:
+            messagebox.showwarning("No Files", "Add .stm and DOT PDF files.")
+            return
+        op = filedialog.asksaveasfilename(
+            title="Save output as",
+            defaultextension=".pdf",
+            initialfile=default_output_name,
+            filetypes=[("PDF files", "*.pdf")],
+        )
+        if not op:
+            return
         for fp in file_list:
-            if not os.path.isfile(fp): messagebox.showerror("Not Found",f"Missing:\n{fp}"); return
-        lt.configure(state='normal'); lt.delete('1.0',tk.END); lt.configure(state='disabled')
-        gb.configure(state='disabled',text="Generating...")
-        old=sys.stdout; sys.stdout=LR(lt)
-        def dw():
+            if not os.path.isfile(fp):
+                messagebox.showerror("Not Found", f"Missing:\n{fp}")
+                return
+
+        log_widget.configure(state="normal")
+        log_widget.delete("1.0", "end")
+        log_widget.configure(state="disabled")
+        action_btn.configure(state="disabled", text="Generating...")
+        old_stdout = sys.stdout
+        sys.stdout = LogRedirector(log_widget)
+
+        def _worker():
             try:
                 print("Classifying files...")
-                sf,df,of,pf=classify_files(file_list)
-                if not sf: root.after(0,lambda:messagebox.showerror("Error","No .stm files found.")); return
-                # Callback for missing plan views — runs on main thread via Event
+                sf, df, of, pf = classify_files(file_list)
+                if not sf:
+                    root.after(0, lambda: messagebox.showerror("Error", "No .stm files found."))
+                    return
+
                 import threading as _thr
                 _result = [None]
-                _event = _thr.Event()
-                def _ask_plan(sn):
+                _event  = _thr.Event()
+
+                def _gui_prompt(title, msg):
                     def _do():
-                        _result[0] = messagebox.askyesno(
-                            "Missing Plan View",
-                            f"No Hydraflow plan view found for system '{sn}'.\n\n"
-                            "Continue without a plan view for this system?")
+                        _result[0] = messagebox.askyesno(title, msg)
                         _event.set()
                     root.after(0, _do)
-                    _event.wait(); _event.clear()
+                    _event.wait()
+                    _event.clear()
                     return _result[0]
-                generate_deliverable(sf,df,op,of,pf,missing_plan_cb=_ask_plan)
-                root.after(0,lambda:messagebox.showinfo("Complete",f"Saved to:\n{op}"))
+
+                def _ask_plan(sn):
+                    return _gui_prompt(
+                        "Missing Plan View",
+                        f"No Hydraflow plan view found for system '{sn}'.\n\n"
+                        "Continue without a plan view for this system?",
+                    )
+
+                def _ask_warning(msg):
+                    return _gui_prompt("Warning", msg)
+
+                success = generate_deliverable(
+                    sf, df, op, of, pf,
+                    missing_plan_cb=_ask_plan,
+                    warning_cb=_ask_warning,
+                )
+                if success:
+                    root.after(0, lambda: messagebox.showinfo("Complete", f"Saved to:\n{op}"))
+                else:
+                    root.after(0, lambda: messagebox.showwarning("Cancelled", "Generation was cancelled."))
             except Exception as e:
-                root.after(0,lambda:messagebox.showerror("Error",str(e)))
+                root.after(0, lambda: messagebox.showerror("Error", str(e)))
                 import traceback; traceback.print_exc()
             finally:
-                sys.stdout=old; root.after(0,lambda:gb.configure(state='normal',text="Generate Storm-Sewer Profiles"))
-        threading.Thread(target=dw,daemon=True).start()
-    def rsc():
-        pdfs=[f for f in file_list if f.lower().endswith('.pdf')]
-        if not pdfs: messagebox.showwarning("No PDFs","Add DOT PDF files for system check."); return
-        op=ov.get().strip()
-        if not op: messagebox.showwarning("No Output","Specify output path."); return
-        base,ext=os.path.splitext(op)
-        sc_out=f"{base}_check{ext}"
+                sys.stdout = old_stdout
+                root.after(0, lambda: action_btn.configure(state="normal", text="Generate profiles"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ---- Compile reports ----
+    def run_compile(file_list, default_output_name, log_widget, action_btn):
+        pdfs = [f for f in file_list if f.lower().endswith(".pdf")]
+        if not pdfs:
+            messagebox.showwarning("No PDFs", "Add report PDF files.")
+            return
+        op = filedialog.asksaveasfilename(
+            title="Save output as",
+            defaultextension=".pdf",
+            initialfile=default_output_name,
+            filetypes=[("PDF files", "*.pdf")],
+        )
+        if not op:
+            return
         for fp in pdfs:
-            if not os.path.isfile(fp): messagebox.showerror("Not Found",f"Missing:\n{fp}"); return
-        lt.configure(state='normal'); lt.delete('1.0',tk.END); lt.configure(state='disabled')
-        sb.configure(state='disabled',text="Checking...")
-        old=sys.stdout; sys.stdout=LR(lt)
-        def dw():
-            try:
-                generate_system_check(pdfs, sc_out)
-                root.after(0,lambda:messagebox.showinfo("Complete",f"System check saved to:\n{sc_out}"))
-            except Exception as e:
-                root.after(0,lambda:messagebox.showerror("Error",str(e)))
-                import traceback; traceback.print_exc()
-            finally:
-                sys.stdout=old; root.after(0,lambda:sb.configure(state='normal',text="System Check"))
-        threading.Thread(target=dw,daemon=True).start()
-    def rcr():
-        pdfs=[f for f in file_list if f.lower().endswith('.pdf')]
-        if not pdfs: messagebox.showwarning("No PDFs","Add report PDF files."); return
-        op=ov.get().strip()
-        if not op: messagebox.showwarning("No Output","Specify output path."); return
-        for fp in pdfs:
-            if not os.path.isfile(fp): messagebox.showerror("Not Found",f"Missing:\n{fp}"); return
-        lt.configure(state='normal'); lt.delete('1.0',tk.END); lt.configure(state='disabled')
-        cb.configure(state='disabled',text="Compiling...")
-        old=sys.stdout; sys.stdout=LR(lt)
-        def dw():
+            if not os.path.isfile(fp):
+                messagebox.showerror("Not Found", f"Missing:\n{fp}")
+                return
+
+        log_widget.configure(state="normal")
+        log_widget.delete("1.0", "end")
+        log_widget.configure(state="disabled")
+        action_btn.configure(state="disabled", text="Compiling...")
+        old_stdout = sys.stdout
+        sys.stdout = LogRedirector(log_widget)
+
+        def _worker():
             try:
                 print("Classifying files...")
-                _,df,of,_pf=classify_files(pdfs)
-                if not df and not of: root.after(0,lambda:messagebox.showerror("Error","No report data found in PDFs.")); return
-                compile_reports(df,op,of)
-                root.after(0,lambda:messagebox.showinfo("Complete",f"Saved to:\n{op}"))
+                _, df, of, _pf = classify_files(pdfs)
+                if not df and not of:
+                    root.after(0, lambda: messagebox.showerror("Error", "No report data found in PDFs."))
+                    return
+                compile_reports(df, op, of)
+                root.after(0, lambda: messagebox.showinfo("Complete", f"Saved to:\n{op}"))
             except Exception as e:
-                root.after(0,lambda:messagebox.showerror("Error",str(e)))
+                root.after(0, lambda: messagebox.showerror("Error", str(e)))
                 import traceback; traceback.print_exc()
             finally:
-                sys.stdout=old; root.after(0,lambda:cb.configure(state='normal',text="Compile Reports"))
-        threading.Thread(target=dw,daemon=True).start()
-    gb.configure(command=rg); cb.configure(command=rcr); sb.configure(command=rsc); root.mainloop()
+                sys.stdout = old_stdout
+                root.after(0, lambda: action_btn.configure(state="normal", text="Compile reports"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ---- Line capacity check ----
+    def run_check(file_list, default_output_name, log_widget, action_btn):
+        pdfs = [f for f in file_list if f.lower().endswith(".pdf")]
+        if not pdfs:
+            messagebox.showwarning("No PDFs", "Add DOT PDF files.")
+            return
+        op = filedialog.asksaveasfilename(
+            title="Save output as",
+            defaultextension=".pdf",
+            initialfile=default_output_name,
+            filetypes=[("PDF files", "*.pdf")],
+        )
+        if not op:
+            return
+        base, ext = os.path.splitext(op)
+        sc_out = f"{base}_check{ext}"
+        for fp in pdfs:
+            if not os.path.isfile(fp):
+                messagebox.showerror("Not Found", f"Missing:\n{fp}")
+                return
+
+        log_widget.configure(state="normal")
+        log_widget.delete("1.0", "end")
+        log_widget.configure(state="disabled")
+        action_btn.configure(state="disabled", text="Checking...")
+        old_stdout = sys.stdout
+        sys.stdout = LogRedirector(log_widget)
+
+        def _worker():
+            try:
+                generate_system_check(pdfs, sc_out)
+                root.after(0, lambda: messagebox.showinfo("Complete", f"Saved to:\n{sc_out}"))
+            except Exception as e:
+                root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                import traceback; traceback.print_exc()
+            finally:
+                sys.stdout = old_stdout
+                root.after(0, lambda: action_btn.configure(state="normal", text="Run line capacity check"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # =========================================================================
+    # BUILD PAGES
+    # =========================================================================
+    page_gen, _, _, _, drop_generate = build_page(
+        main_area,
+        action_label="Generate profiles",
+        action_color=COLOR_GENERATE,
+        action_fn=run_generate,
+        default_output_name="deliverable.pdf",
+    )
+    pages["generate"] = page_gen
+
+    page_compile, _, _, _, drop_compile = build_page(
+        main_area,
+        action_label="Compile reports",
+        action_color=COLOR_COMPILE,
+        action_fn=run_compile,
+        default_output_name="compiled.pdf",
+    )
+    pages["compile"] = page_compile
+
+    page_check, _, _, _, drop_check = build_page(
+        main_area,
+        action_label="Run line capacity check",
+        action_color=COLOR_CHECK,
+        action_fn=run_check,
+        default_output_name="check.pdf",
+        accepted_extensions=[".pdf"],
+        sort_alpha=True,
+    )
+    pages["check"] = page_check
+
+    # Route drops to whichever page is currently active.
+    # Registering on root covers all child widgets with no propagation issues.
+    _drop_handlers = {
+        "generate": drop_generate,
+        "compile":  drop_compile,
+        "check":    drop_check,
+    }
+    _active_page = ["generate"]
+
+    _original_switch = switch_page
+    def switch_page(page_id):
+        _active_page[0] = page_id
+        _original_switch(page_id)
+
+    def _root_on_drop(event):
+        _drop_handlers[_active_page[0]](event.data)
+
+    root.drop_target_register(DND_FILES)
+    root.dnd_bind('<<Drop>>', _root_on_drop)
+
+    # Start on Generate page
+    switch_page("generate")
+    root.mainloop()
 
 
 if __name__ == '__main__':
