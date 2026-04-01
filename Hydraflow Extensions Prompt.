@@ -1,0 +1,62 @@
+You are building an Excel workbook (.xlsx) for storm sewer data entry that feeds into Hydraflow Storm Sewers Extension via CSV export. The workbook has two sheets: Lines and Inlets. It must be built with openpyxl.
+
+GENERAL RULES
+
+All column headers must exactly match the names listed below — these are parsed by a Python script that uses them as keys.
+No commas or quotation marks are allowed in any text input cell. Add a note or comment on the Line ID and Inlet ID cells stating this.
+Read-only/reference columns are filled with a medium grey fill (D9D9D9) and have sheet protection applied so they cannot be edited.
+Editable columns have a white or light blue fill (EBF4FF) and are unlocked.
+Each sheet is protected (password optional, your choice), with only unlocked cells editable.
+Row 1 is a frozen, bold header row on both sheets.
+Provide 25 blank data rows below the header on each sheet (rows 2–26), pre-formatted with all fills, dropdowns, and conditional formatting applied.
+Column widths should be set to fit the header text comfortably.
+
+DEFAULTS SECTION (Both Sheets)
+At the top of each sheet, insert a Defaults band above the main data table:
+
+Row 1: A merged cell across all columns labeled "DEFAULT VALUES" — bold, white text on a dark blue background (1F3864).
+Row 2: One input cell per editable column, aligned to match the column position of the main table below. These cells are filled yellow (FFFACD) and unlocked. Leave read-only columns empty/grey in this row.
+Row 3: Main table header row (bold, dark blue background, white text).
+Rows 4–28: 25 data rows.
+
+The yellow default cells in row 2 accept the same input types and dropdown lists as the corresponding data column below them. A user fills in whichever defaults they want, and the Python importer reads row 2 before reading the data rows — any data cell left blank in the table will be back-filled with the corresponding default value from row 2 during the merge. If a data cell has a value, it takes priority over the default.
+Add a note on the merged row 1 cell stating: "Fill yellow cells to set defaults. Blank cells in the table below will inherit the default value during import. Individual row values always take priority."
+
+SHEET 1 — "Lines"
+
+ColumnHeaderEditable?Type / ValidationALine No.Read-onlyInteger reference — grey fillBLine IDEditableText. Note: no commas or quotesCJunction TypeEditableDropdown: Manhole, Curb, Grate, Combination Curb and Grate, Generic, Drop Curb, Drop Grate, Open Headwall, NoneDKnown Q (cfs)EditableNumber ≥ 0EDrainage Area (ac)EditableNumber ≥ 0FRunoff Coeff (C)EditableNumber, 0.00–1.00GInlet Time (min)EditableNumber ≥ 0HInvert Elev Dn (ft)EditableNumber (0 = auto-design)ILine Slope (%)EditableNumber — light yellow fill (FFFACD) with note: "Auto-calculated from inverts if left 0. Overrides upstream invert if entered."JInvert Elev Up (ft)EditableNumber (0 = auto-design)KRise (in)EditableNumber ≥ 0 (0 = auto-design)LLine TypeEditableDropdown: Cir, Ellip, BoxMSpan (in)EditableNumber ≥ 0. Conditional note: equals Rise for circular pipeNN-ValueEditableNumber, 0.000–0.999 (typically 0.013)OJ-Loss CoeffEditableNumber ≥ 0PInl/Rim Elev Dn (ft)EditableNumberQInl/Rim Elev Up (ft)EditableNumber
+Conditional Formatting — Lines sheet:
+
+If Line Type (col L) = Cir: highlight Span cell (col M) grey and add a cell note: "Span = Rise for circular pipes."
+If Line Type = Ellip or Box: highlight Span white/blue to indicate it must be filled independently.
+
+(These are visual cues only — enforcement happens in the Python merger.)
+
+SHEET 2 — "Inlets"
+Columns (in order):
+ColumnHeaderEditable?Notes / ValidationALine No.Read-onlyGrey fill — reference key to Lines sheetBInlet IDEditableText. No commas or quotesCInlet TypeEditableDropdown: Manhole, Curb, Grate, Combination Curb and Grate, Generic, Drop Curb, Drop Grate, Open Headwall, NoneDLocationEditableDropdown: Sag, On Grade. Grey/disabled note: "Not required for Manhole, Headwall, None"EBypass Line No.EditableInteger ≥ 0FCurb Length (ft)EditableNumber ≥ 0. Applies to: Curb, Combination, Drop Curb only. 0 = auto-designGCurb Tht. Ht. (in)EditableNumber ≥ 0. Applies to: Curb (Horiz), Combination, Drop Curb onlyHGrate Area (sqft)EditableNumber ≥ 0. Applies to: Grate, Combination, Drop Grate only. Required in SagIGrate Width (ft)EditableNumber ≥ 0. Applies to: Grate, Combination, Drop Grate onlyJGrate Length (ft)EditableNumber ≥ 0. Applies to: Grate, Combination, Drop Grate only. 0 = auto-designKGeneric Capac. (cfs)EditableNumber ≥ 0. Applies to: Generic only. 0 = auto-designLRd. Cross Slope Sx (ft/ft)EditableNumber ≥ 0. Not required for: Manhole, Headwall, NoneMGtr. Cross Slope Sw (ft/ft)EditableNumber ≥ 0. Not required for: Manhole, Headwall, None, Drop Curb, Drop GrateNLocal Depression (in)EditableNumber ≥ 0OGutter Width (ft)EditableNumber ≥ 0. Not required for: Manhole, Headwall, None, Drop CurbPLong. Slope (ft/ft)EditableNumber ≥ 0. Not required for: Manhole, Headwall, None, Drop Curb, or any Sag inlet (auto-set to 0 by Hydraflow)QGutter N-ValueEditableNumber, 0.000–0.999. Not required for: Manhole, Headwall, None, Drop Curb
+Conditional Formatting — Inlets sheet:
+Apply grey fill conditionally based on Inlet Type (col C) to visually indicate fields that do not apply. Use Excel conditional formatting rules per column:
+
+Curb Length (F): grey if Inlet Type is NOT one of: Curb, Combination Curb and Grate, Drop Curb
+Curb Tht. Ht. (G): grey if Inlet Type is NOT one of: Curb, Combination Curb and Grate, Drop Curb
+Grate Area (H): grey if Inlet Type is NOT one of: Grate, Combination Curb and Grate, Drop Grate
+Grate Width (I): grey if Inlet Type is NOT one of: Grate, Combination Curb and Grate, Drop Grate
+Grate Length (J): grey if Inlet Type is NOT one of: Grate, Combination Curb and Grate, Drop Grate
+Generic Capac. (K): grey if Inlet Type ≠ Generic
+Rd. Cross Slope Sx (L): grey if Inlet Type is one of: Manhole, Headwall, None
+Gtr. Cross Slope Sw (M): grey if Inlet Type is one of: Manhole, Headwall, None, Drop Curb, Drop Grate
+Gutter Width (O): grey if Inlet Type is one of: Manhole, Headwall, None, Drop Curb
+Long. Slope (P): grey if Inlet Type is one of: Manhole, Headwall, None, Drop Curb, OR if Location = Sag
+Gutter N-Value (Q): grey if Inlet Type is one of: Manhole, Headwall, None, Drop Curb
+
+
+ADDITIONAL NOTES
+
+The Location field (Inlets col D) should also show a note that Drop Curb inlets are always assumed to be in a sag by Hydraflow — the Location field is not required for them.
+The Generic Capac. field should have a note: "WARNING: Generic inlets should not be used in sags when capacity < total Q."
+The Line Slope field should have a note: "If Invert Dn and Invert Up are both entered, slope is auto-calculated by the importer. Enter a slope here only if you want to override the upstream invert."
+The Inlets sheet is parallel to the Lines sheet — it has one row per line number, in the same order. Line No. (col A) on the Inlets sheet must match Line No. on the Lines sheet row-for-row. Pre-populate the Line No. column in rows 4–28 with the formula =Lines!A4 (and so on down) so they stay synchronized automatically. This column is read-only (grey fill, locked).
+Not every line will have meaningful inlet data. For lines that don't have an inlet (e.g. a manhole-only junction), the user simply leaves those editable cells blank — the importer will treat blank as zero or preserve the original .stm value per the whitelist rules.
+Do not allow the Inlets sheet to have a different number of rows than the Lines sheet, and do not allow Line No. to be manually typed. It must always mirror the Lines sheet.
+Use openpyxl. Do not use xlwings or win32com.
