@@ -62,10 +62,10 @@ def parse_stm(filepath):
                 lines[current_line['Line No.']] = current_line
             break
         # X,Y coordinate fields have comma in key name
-        xy_match = re.match(r'^"X,Y Coord (Dn|Up)\s*=?\s*"\s*,\s*(-?\d+)\s*,\s*(-?\d+)', row)
+        xy_match = re.match(r'^"X,Y Coord (Dn|Up)\s*=?\s*"\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)', row)
         if xy_match and in_line_data:
-            current_line[f'X Coord {xy_match.group(1)}'] = int(xy_match.group(2))
-            current_line[f'Y Coord {xy_match.group(1)}'] = int(xy_match.group(3))
+            current_line[f'X Coord {xy_match.group(1)}'] = float(xy_match.group(2))
+            current_line[f'Y Coord {xy_match.group(1)}'] = float(xy_match.group(3))
             continue
         if ',' in row and row.startswith('"'):
             parts = row.split(',', 1)
@@ -2019,53 +2019,6 @@ def main():
 # SECTION 8: GUI
 # =============================================================================
 
-# Spreadsheet column schemas for the Per-Line Data tab.
-# Each tuple: (header_text, stm_key, widget_type, active_types_or_None)
-#   widget_type : 'entry' | 'option_jtype' | 'option_linetype' | 'option_location' | 'label'
-#   active_types: frozenset of Junction Type codes where the cell is active,
-#                 or None meaning always-active.
-#                 Inactive entry cells display '--' and are disabled.
-
-_LINES_COLS = [
-    ('Line No.',     None,                   'label',           None),
-    ('Line ID',      'Line ID',              'entry',           None),
-    ('DS Line No.',  'Downstream Line No.',  'entry',           None),
-    ('Length',       'Line Length',          'entry',           None),
-    ('Known Q',      'Known Q',              'entry',           None),
-    ('Drain Area',   'Drainage Area',        'entry',           None),
-    ('Runoff C',     'Runoff Coeff.',        'entry',           None),
-    ('Inlet Time',   'Inlet Time',           'entry',           None),
-    ('Invert Dn',    'Invert Elev Dn',       'entry',           None),
-    ('Slope',        'Line Slope',           'entry',           None),
-    ('Invert Up',    'Invert Elev Up',       'entry',           None),
-    ('Rise',         'Rise',                 'entry',           None),
-    ('Line Type',    'Line Type',            'option_linetype', None),
-    ('Span',         'Span',                 'entry',           None),
-    ('N-Value',      'N-Value',              'entry',           None),
-    ('J-Loss Coeff', 'Junction Loss Coeff',  'entry',           None),
-    ('Rim Elev Dn',  'Ground / Rim Elev Dn', 'entry',           None),
-    ('Rim Elev Up',  'Ground / Rim Elev Up', 'entry',           None),
-]
-
-_INLETS_COLS = [
-    ('Line No.',      None,                    'label',           None),
-    ('Inlet ID',      'Inlet ID',              'entry',           None),
-    ('Junc. Type',    'Junction Type',         'option_jtype',    None),
-    ('Location',      'Inlet Sag',             'option_location', None),
-    ('Bypass Target', 'Downstream Inlet No.',  'entry',           None),
-    ('Inlet Length',  'Inlet Length',          'entry',           frozenset({1, 3, 5})),
-    ('Throat Ht',     'Inlet throat height',   'entry',           frozenset({1, 3, 5})),
-    ('Opening Area',  'Grate Opening Area',    'entry',           frozenset({2, 3, 6})),
-    ('Grate Width',   'Grate Width',           'entry',           frozenset({2, 3, 6})),
-    ('Grate Length',  'Grate Length',          'entry',           frozenset({2, 3, 6})),
-    ('Known Cap.',    'Known Capacity',        'entry',           frozenset({4})),
-    ('Sx',            'Inlet Cross Slope Sx',  'entry',           frozenset({1, 2, 3, 4, 5, 6})),
-    ('Sw',            'Inlet Cross Slope Sw',  'entry',           frozenset({1, 2, 3, 4})),
-    ('Local Depress', 'Local Inlet Depression','entry',           frozenset({1, 2, 3, 4})),
-    ('Gutter Width',  'Gutter Width',          'entry',           frozenset({2, 3, 4, 6})),
-    ('Gutter Slope',  'Gutter Slope',          'entry',           frozenset({1, 2, 3, 4, 6})),
-    ('Gutter N',      'Gutter N-Value',        'entry',           frozenset({1, 2, 3, 4, 6})),
-]
 
 def launch_gui():
     matplotlib.use('TkAgg', force=True)
@@ -2621,14 +2574,13 @@ def launch_gui():
     pages["check"] = page_check
 
     # ---- STM Editor (custom page) -------------------------------------------
+    import tkinter.ttk as ttk
 
     # -- State --
     editor_stm_path   = [None]
-    _grid_line_nos    = []        # sorted line numbers shared by both grids
-    _L_vars           = {}        # {(row_idx, col_idx): StringVar}  Lines grid
-    _L_widgets        = {}        # {(row_idx, col_idx): widget}     Lines grid
-    _I_vars           = {}        # {(row_idx, col_idx): StringVar}  Inlets grid
-    _I_widgets        = {}        # {(row_idx, col_idx): widget}     Inlets grid
+    _grid_line_nos    = []   # sorted line numbers (ints)
+    _L_data           = {}   # {line_no: {stm_key: value_str}}  Lines data
+    _I_data           = {}   # {line_no: {stm_key: value_str}}  Inlets data
     _plan_canvas_widget = [None]
 
     _JTYPE_DISPLAY   = {
@@ -2638,9 +2590,49 @@ def launch_gui():
     _JTYPE_VALUES    = list(_JTYPE_DISPLAY.values())
     _LOCATION_VALUES = ['On Grade', 'Sag']
     _LINETYPE_VALUES = ['Circular', 'Box', 'Elliptical']
-    _COL_W           = {'label': 55, 'entry': 88, 'option_jtype': 155,
-                        'option_linetype': 110, 'option_location': 100}
-    _HDR_H           = 30
+
+    # Column schemas: (header_text, stm_key, col_width, cell_type, active_types|None)
+    # cell_type: 'entry' | 'combo_jtype' | 'combo_linetype' | 'combo_location'
+    _LINES_COLS = [
+        ('Line No.',     'Line No.',              55,  'entry',           None),
+        ('Line ID',      'Line ID',               90,  'entry',           None),
+        ('DS Line No.',  'Downstream Line No.',   70,  'entry',           None),
+        ('Length',       'Line Length',           70,  'entry',           None),
+        ('Known Q',      'Known Q',               70,  'entry',           None),
+        ('Drain Area',   'Drainage Area',         80,  'entry',           None),
+        ('Runoff C',     'Runoff Coeff.',         70,  'entry',           None),
+        ('Inlet Time',   'Inlet Time',            70,  'entry',           None),
+        ('Invert Dn',    'Invert Elev Dn',        80,  'entry',           None),
+        ('Slope',        'Line Slope',            70,  'entry',           None),
+        ('Invert Up',    'Invert Elev Up',        80,  'entry',           None),
+        ('Rise',         'Rise',                  60,  'entry',           None),
+        ('Line Type',    'Line Type',            110,  'combo_linetype',  None),
+        ('Span',         'Span',                  60,  'entry',           None),
+        ('N-Value',      'N-Value',               70,  'entry',           None),
+        ('J-Loss Coeff', 'Junction Loss Coeff',   85,  'entry',           None),
+        ('Rim Elev Dn',  'Ground / Rim Elev Dn',  85,  'entry',           None),
+        ('Rim Elev Up',  'Ground / Rim Elev Up',  85,  'entry',           None),
+    ]
+
+    _INLETS_COLS = [
+        ('Line No.',      'Line No.',               55,  'entry',           None),
+        ('Inlet ID',      'Inlet ID',               90,  'entry',           None),
+        ('Junc. Type',    'Junction Type',          155,  'combo_jtype',    None),
+        ('Location',      'Inlet Sag',             100,  'combo_location',  None),
+        ('Bypass Target', 'Downstream Inlet No.',   80,  'entry',           None),
+        ('Inlet Length',  'Inlet Length',            80,  'entry',           frozenset({1, 3, 5})),
+        ('Throat Ht',     'Inlet throat height',     75,  'entry',           frozenset({1, 3, 5})),
+        ('Opening Area',  'Grate Opening Area',      85,  'entry',           frozenset({2, 3, 6})),
+        ('Grate Width',   'Grate Width',             80,  'entry',           frozenset({2, 3, 6})),
+        ('Grate Length',  'Grate Length',            80,  'entry',           frozenset({2, 3, 6})),
+        ('Known Cap.',    'Known Capacity',          80,  'entry',           frozenset({4})),
+        ('Sx',            'Inlet Cross Slope Sx',    60,  'entry',           frozenset({1, 2, 3, 4, 5, 6})),
+        ('Sw',            'Inlet Cross Slope Sw',    60,  'entry',           frozenset({1, 2, 3, 4})),
+        ('Local Depress', 'Local Inlet Depression',  90,  'entry',           frozenset({1, 2, 3, 4})),
+        ('Gutter Width',  'Gutter Width',            80,  'entry',           frozenset({2, 3, 4, 6})),
+        ('Gutter Slope',  'Gutter Slope',            80,  'entry',           frozenset({1, 2, 3, 4, 6})),
+        ('Gutter N',      'Gutter N-Value',          70,  'entry',           frozenset({1, 2, 3, 4, 6})),
+    ]
 
     # -- Outer frame --
     editor_frame = ctk.CTkFrame(main_area, fg_color="transparent", corner_radius=0)
@@ -2710,23 +2702,564 @@ def launch_gui():
     )
     editor_save_btn.grid(row=1, column=0, sticky="ew", padx=16, pady=8)
 
-    # ---- Tab view (2 tabs) ----
+    # ---- Tab view (3 tabs) ----
     editor_tabview = ctk.CTkTabview(editor_frame, corner_radius=8)
     editor_tabview.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
-    editor_tabview.add("Per-Line Data")
+    editor_tabview.add("Lines")
+    editor_tabview.add("Inlets")
     editor_tabview.add("Plan View")
 
-    # ==============================
-    # TAB 1: Per-Line Data
-    # ==============================
-    tab_per_line = editor_tabview.tab("Per-Line Data")
-    tab_per_line.grid_columnconfigure(0, weight=1)
-    tab_per_line.grid_rowconfigure(0, weight=0)   # defaults strip — fixed
-    tab_per_line.grid_rowconfigure(1, weight=1)   # Lines grid
-    tab_per_line.grid_rowconfigure(2, weight=1)   # Inlets grid
+    # Treeview style (dark theme matching app)
+    _tv_style = ttk.Style()
+    _tv_style.theme_use('default')
+    _tv_style.configure('Grid.Treeview',
+        background='#2b2b2b', foreground='#dcdcdc',
+        fieldbackground='#2b2b2b', rowheight=28, borderwidth=0)
+    _tv_style.configure('Grid.Treeview.Heading',
+        background='#1a3a5c', foreground='#a0c0e0',
+        font=('Segoe UI', 9, 'bold'), relief='flat')
+    _tv_style.map('Grid.Treeview',
+        background=[('selected', '#2e4a6a')],
+        foreground=[('selected', '#ffffff')])
 
-    # ---- Defaults strip ----
-    dstrip = ctk.CTkFrame(tab_per_line, corner_radius=8)
+    # Overlay state — one overlay open at a time across both grids
+    _ov = {'widget': None, 'tree': None, 'iid': None, 'col_idx': None,
+           'schema': None, 'stm_key': None, 'hdr': None}
+    _disabled = {}  # {(id(tree), iid, col_idx): True} for N/A inlet cells
+
+    # ==============================
+    # Grid factory  (defined before TAB setups that call it)
+    # ==============================
+    def _make_tree(parent, schema):
+        """Create a scrollable ttk.Treeview with overlay editing. Returns (frame, tree)."""
+        frame = ctk.CTkFrame(parent, corner_radius=8, fg_color='#1e1e1e')
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+        cols = [hdr for hdr, *_ in schema]
+        tree = ttk.Treeview(frame, columns=cols, show='headings',
+                            style='Grid.Treeview', selectmode='browse')
+        for hdr, stm_key, width, cell_type, _ in schema:
+            tree.heading(hdr, text=hdr, anchor='center')
+            tree.column(hdr, width=width, minwidth=max(40, width - 10),
+                        stretch=False, anchor='center')
+        tree.tag_configure('even', background='#2b2b2b', foreground='#dcdcdc')
+        tree.tag_configure('odd',  background='#252525', foreground='#dcdcdc')
+        vsb = ttk.Scrollbar(frame, orient='vertical',   command=tree.yview)
+        hsb = ttk.Scrollbar(frame, orient='horizontal', command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+
+        def _on_click(event):
+            if tree.identify('region', event.x, event.y) != 'cell':
+                return
+            col_id = tree.identify_column(event.x)
+            iid    = tree.identify_row(event.y)
+            if not iid or not col_id:
+                return
+            col_idx = int(col_id.lstrip('#')) - 1
+            tree.selection_set(iid)
+            _open_overlay(tree, schema, iid, col_idx)
+
+        def _on_key(event):
+            sel = tree.selection()
+            if not sel:
+                return
+            iid = sel[0]
+            col_idx = (_ov['col_idx'] if _ov['col_idx'] is not None
+                       and _ov['tree'] is tree else 0)
+            ks = event.keysym
+            if ks in ('Tab', 'ISO_Left_Tab'):
+                _navigate(tree, schema, iid, col_idx, 'right')
+                return 'break'
+            elif ks == 'Return':
+                _open_overlay(tree, schema, iid, col_idx)
+                return 'break'
+            elif ks == 'Up':
+                _navigate(tree, schema, iid, col_idx, 'up')
+                return 'break'
+            elif ks == 'Down':
+                _navigate(tree, schema, iid, col_idx, 'down')
+                return 'break'
+            elif ks == 'Left':
+                _navigate(tree, schema, iid, col_idx, 'left')
+                return 'break'
+            elif ks == 'Right':
+                _navigate(tree, schema, iid, col_idx, 'right')
+                return 'break'
+            elif event.char and event.char.isprintable():
+                _open_overlay(tree, schema, iid, col_idx, seed_char=event.char)
+                return 'break'
+
+        tree.bind('<Button-1>', _on_click)
+        tree.bind('<KeyPress>',  _on_key)
+        return frame, tree
+
+    # ==============================
+    # Overlay helpers
+    # ==============================
+    def _close_overlay(commit=True):
+        w = _ov['widget']
+        if w is None:
+            return
+        stm_key = _ov['stm_key']
+        hdr     = _ov['hdr']
+        tree    = _ov['tree']
+        iid     = _ov['iid']
+        schema  = _ov['schema']
+        col_idx = _ov['col_idx']
+        if commit:
+            try:
+                exists = w.winfo_exists()
+            except Exception:
+                exists = False
+            if exists:
+                val = w.get().strip() if hasattr(w, 'get') else ''
+                if val and iid and hdr and tree and tree.exists(iid):
+                    tree.set(iid, hdr, val)
+                    data = _L_data if tree is tree_L else _I_data
+                    try:
+                        ln = int(tree.set(iid, schema[0][0]))
+                    except (ValueError, TypeError):
+                        ln = None
+                    if ln is not None and stm_key and stm_key != 'Line No.':
+                        data.setdefault(ln, {})[stm_key] = val
+                    if schema is _INLETS_COLS and stm_key == 'Junction Type':
+                        _update_inlet_row_states(iid)
+                    if stm_key == 'Line No.':
+                        try:
+                            new_no = int(val)
+                            old_no = int(iid)
+                        except (ValueError, TypeError):
+                            pass
+                        else:
+                            if old_no != new_no:
+                                _rename_line(old_no, new_no, tree, schema, iid)
+        try:
+            w.place_forget()
+            w.destroy()
+        except Exception:
+            pass
+        _ov['widget'] = None
+
+    def _open_overlay(tree, schema, iid, col_idx, seed_char=None):
+        _close_overlay()
+        hdr, stm_key, width, cell_type, active_types = schema[col_idx]
+        if _disabled.get((id(tree), iid, col_idx)):
+            return
+        bbox = tree.bbox(iid, column=f'#{col_idx + 1}')
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        current = tree.set(iid, hdr)
+        if current == '--':
+            current = ''
+        _ov.update({'tree': tree, 'iid': iid, 'col_idx': col_idx,
+                    'schema': schema, 'stm_key': stm_key, 'hdr': hdr})
+
+        if cell_type in ('combo_jtype', 'combo_linetype', 'combo_location'):
+            vals = (_JTYPE_VALUES if cell_type == 'combo_jtype' else
+                    _LINETYPE_VALUES if cell_type == 'combo_linetype' else
+                    _LOCATION_VALUES)
+            cb = ttk.Combobox(tree, values=vals, state='readonly', font=FONT_BODY)
+            cb.set(current if current in vals else vals[0])
+            cb.place(x=x, y=y, width=w + 1, height=h)
+            _ov['widget'] = cb
+            cb.focus_set()
+            cb.event_generate('<Button-1>')
+
+            def _cb_mv(mv):
+                root.after(10, lambda: (_close_overlay(commit=True),
+                                        _navigate(tree, schema, iid, col_idx, mv)))
+
+            cb.bind('<<ComboboxSelected>>', lambda e: _cb_mv('stay'))
+            cb.bind('<Return>', lambda e: (_cb_mv('down'), 'break')[1])
+            cb.bind('<Tab>',    lambda e: (_cb_mv('right'), 'break')[1])
+            cb.bind('<Up>',     lambda e: (_cb_mv('up'), 'break')[1])
+            cb.bind('<Left>',   lambda e: (_cb_mv('left'), 'break')[1])
+            cb.bind('<Escape>', lambda e: _close_overlay(commit=False))
+        else:
+            ent = tk.Entry(tree, font=FONT_BODY,
+                           bg='#1e3a5c', fg='#ffffff',
+                           insertbackground='#ffffff',
+                           selectbackground='#2e5a8c',
+                           relief='flat', bd=1)
+            if seed_char:
+                ent.insert(0, seed_char)
+            else:
+                ent.insert(0, current)
+                ent.select_range(0, 'end')
+            ent.place(x=x, y=y, width=w + 1, height=h)
+            _ov['widget'] = ent
+            ent.focus_set()
+
+            def _mv(d, _e=None):
+                _close_overlay(commit=True)
+                _navigate(tree, schema, iid, col_idx, d)
+                return 'break'
+
+            def _left_guard(e):
+                if ent.index('insert') == 0:
+                    return _mv('left')
+
+            def _right_guard(e):
+                if ent.index('insert') == len(ent.get()):
+                    return _mv('right')
+
+            ent.bind('<Return>',   lambda e: _mv('down'))
+            ent.bind('<Tab>',      lambda e: _mv('right'))
+            ent.bind('<Up>',       lambda e: _mv('up'))
+            ent.bind('<Down>',     lambda e: _mv('down'))
+            ent.bind('<Left>',     _left_guard)
+            ent.bind('<Right>',    _right_guard)
+            ent.bind('<Escape>',   lambda e: _close_overlay(commit=False))
+            ent.bind('<FocusOut>', lambda e: _close_overlay(commit=True))
+
+    def _navigate(tree, schema, iid, col_idx, direction):
+        iids = tree.get_children()
+        if not iids:
+            return
+        nav = list(range(len(schema)))
+        try:
+            cur = list(iids).index(iid)
+        except ValueError:
+            cur = 0
+        n = len(iids)
+        if direction == 'right':
+            nc = next((c for c in nav if c > col_idx), None)
+            if nc is not None:
+                _select_and_open(tree, schema, iids[cur], nc)
+            elif cur + 1 < n:
+                _select_and_open(tree, schema, iids[cur + 1], 0)
+        elif direction == 'left':
+            pc = next((c for c in reversed(nav) if c < col_idx), None)
+            if pc is not None:
+                _select_and_open(tree, schema, iids[cur], pc)
+            elif cur > 0:
+                _select_and_open(tree, schema, iids[cur - 1], nav[-1])
+        elif direction == 'down':
+            if cur + 1 < n:
+                _select_and_open(tree, schema, iids[cur + 1], col_idx)
+        elif direction == 'up':
+            if cur > 0:
+                _select_and_open(tree, schema, iids[cur - 1], col_idx)
+
+    def _select_and_open(tree, schema, iid, col_idx):
+        tree.selection_set(iid)
+        tree.see(iid)
+        root.after(10, lambda: _open_overlay(tree, schema, iid, col_idx))
+
+    # ==============================
+    # Populate trees from data
+    # ==============================
+    def _populate_tree(tree, schema, data_dict):
+        tree.delete(*tree.get_children())
+        for row_idx, line_no in enumerate(_grid_line_nos):
+            data = data_dict.get(line_no, {})
+            values = []
+            for hdr, stm_key, width, cell_type, active_types in schema:
+                if stm_key == 'Line No.':
+                    values.append(str(line_no))
+                elif stm_key is None:
+                    values.append('')
+                elif cell_type == 'combo_jtype':
+                    raw = data.get(stm_key, 3)
+                    code = raw if isinstance(raw, int) else 3
+                    values.append(_JTYPE_DISPLAY.get(code, 'Combination Curb and Grate'))
+                elif cell_type == 'combo_location':
+                    raw = data.get(stm_key, 0)
+                    values.append('On Grade' if raw == 0 else 'Sag')
+                elif cell_type == 'combo_linetype':
+                    raw = data.get(stm_key, 'Circular')
+                    values.append(raw if raw in _LINETYPE_VALUES else 'Circular')
+                else:
+                    raw = data.get(stm_key, '')
+                    values.append(str(raw) if raw != '' and raw is not None else '')
+            tag = 'even' if row_idx % 2 == 0 else 'odd'
+            tree.insert('', 'end', iid=str(line_no), values=values, tags=(tag,))
+
+    def _build_grids(lines_dict):
+        nonlocal _grid_line_nos
+        _grid_line_nos = sorted(lines_dict.keys())
+        _L_data.clear()
+        _I_data.clear()
+        for ln, d in lines_dict.items():
+            _L_data[ln] = dict(d)
+            _I_data[ln] = dict(d)
+        _populate_tree(tree_L, _LINES_COLS, _L_data)
+        _populate_tree(tree_I, _INLETS_COLS, _I_data)
+        for iid in tree_I.get_children():
+            _update_inlet_row_states(iid)
+
+    # ==============================
+    # Conditional cell states (Inlets)
+    # ==============================
+    def _update_inlet_row_states(iid):
+        jtype_hdr = next((h for h, _, _, ct, _ in _INLETS_COLS
+                          if ct == 'combo_jtype'), None)
+        if jtype_hdr is None:
+            return
+        code = JUNCTION_TYPE_CODES.get(tree_I.set(iid, jtype_hdr).lower(), -1)
+        row_vals = list(tree_I.item(iid, 'values'))
+        changed = False
+        for col_idx, (hdr, stm_key, width, cell_type, active_types) in enumerate(_INLETS_COLS):
+            if active_types is None or cell_type != 'entry':
+                continue
+            is_dis = code not in active_types
+            _disabled[(id(tree_I), iid, col_idx)] = is_dis
+            cur = row_vals[col_idx]
+            if is_dis and cur not in ('--', ''):
+                row_vals[col_idx] = '--'; changed = True
+            elif is_dis and cur == '':
+                row_vals[col_idx] = '--'; changed = True
+            elif not is_dis and cur == '--':
+                row_vals[col_idx] = '';  changed = True
+        if changed:
+            tree_I.item(iid, values=row_vals, tags=tree_I.item(iid, 'tags'))
+
+    # ==============================
+    # Line number renaming
+    # ==============================
+    def _rename_line(old_no, new_no, tree, schema, iid):
+        if new_no in _L_data:
+            hdr = next((h for h, k, *_ in schema if k == 'Line No.'), schema[0][0])
+            tree.set(iid, hdr, str(old_no))
+            messagebox.showwarning("Line No. Conflict",
+                f"Line {new_no} already exists. Rename cancelled.")
+            return
+        if old_no in _L_data:
+            _L_data[new_no] = _L_data.pop(old_no)
+        if old_no in _I_data:
+            _I_data[new_no] = _I_data.pop(old_no)
+        ds_key = 'Downstream Line No.'
+        for ln in list(_L_data.keys()):
+            try:
+                if int(_L_data[ln].get(ds_key, -999)) == old_no:
+                    _L_data[ln][ds_key] = new_no
+            except (ValueError, TypeError):
+                pass
+        _grid_line_nos[:] = sorted(_L_data.keys())
+        _populate_tree(tree_L, _LINES_COLS, _L_data)
+        _populate_tree(tree_I, _INLETS_COLS, _I_data)
+        for ii in tree_I.get_children():
+            _update_inlet_row_states(ii)
+
+    # ==============================
+    # Designation auto-naming
+    # ==============================
+    def _regen_names():
+        p     = editor_stm_path[0]
+        desig = ent_designation.get().strip()
+        if not p or not desig or not _grid_line_nos:
+            return
+        try:
+            _, lines = parse_stm(p)
+            names, _ = generate_names(lines, desig)
+        except Exception:
+            return
+        lid_hdr  = next((h for h, k, *_ in _LINES_COLS  if k == 'Line ID'),  None)
+        iid2_hdr = next((h for h, k, *_ in _INLETS_COLS if k == 'Inlet ID'), None)
+        for line_no in _grid_line_nos:
+            if line_no not in names:
+                continue
+            siid = str(line_no)
+            if lid_hdr and tree_L.exists(siid):
+                cur = tree_L.set(siid, lid_hdr)
+                if cur.strip() in ('', '--'):
+                    tree_L.set(siid, lid_hdr, names[line_no].get('Line ID', ''))
+            if iid2_hdr and tree_I.exists(siid):
+                cur = tree_I.set(siid, iid2_hdr)
+                if cur.strip() in ('', '--'):
+                    tree_I.set(siid, iid2_hdr, names[line_no].get('Inlet ID', ''))
+
+    # ==============================
+    # Apply Defaults to Blanks
+    # ==============================
+    def _apply_defaults_to_blanks():
+        if not _grid_line_nos:
+            return
+        itype_code    = JUNCTION_TYPE_CODES.get(inlet_type_var.get().lower(), 0)
+        itype_display = _JTYPE_DISPLAY.get(itype_code, 'Combination Curb and Grate')
+        loc_display   = 'On Grade' if LOCATION_CODES.get(
+            location_var.get().lower(), 0) == 0 else 'Sag'
+        _entry_defaults = {
+            'Runoff Coeff.':          ent_runoff.get().strip(),
+            'Inlet Cross Slope Sx':   ent_sx.get().strip(),
+            'Inlet Cross Slope Sw':   ent_sw.get().strip(),
+            'Inlet Length':           ent_curb_len.get().strip(),
+            'Inlet throat height':    ent_throat.get().strip(),
+            'Grate Width':            ent_grate_w.get().strip(),
+            'Grate Length':           ent_grate_l.get().strip(),
+            'Grate Opening Area':     ent_grate_a.get().strip(),
+        }
+        for line_no in _grid_line_nos:
+            siid = str(line_no)
+            for hdr, stm_key, _, cell_type, _ in _LINES_COLS:
+                if cell_type != 'entry' or stm_key not in _entry_defaults:
+                    continue
+                val = _entry_defaults[stm_key]
+                if val and tree_L.exists(siid) and \
+                        tree_L.set(siid, hdr).strip() in ('', '--'):
+                    tree_L.set(siid, hdr, val)
+            if not tree_I.exists(siid):
+                continue
+            jt_hdr  = next((h for h, k, *_ in _INLETS_COLS if k == 'Junction Type'), None)
+            loc_hdr = next((h for h, k, *_ in _INLETS_COLS if k == 'Inlet Sag'),    None)
+            if jt_hdr  and tree_I.set(siid, jt_hdr).strip()  in ('', '--'):
+                tree_I.set(siid, jt_hdr,  itype_display)
+            if loc_hdr and tree_I.set(siid, loc_hdr).strip() in ('', '--'):
+                tree_I.set(siid, loc_hdr, loc_display)
+            jtype_str = tree_I.set(siid, jt_hdr) if jt_hdr else ''
+            code = JUNCTION_TYPE_CODES.get(jtype_str.lower(), -1)
+            for col_idx, (hdr, stm_key, _, cell_type, active_types) in \
+                    enumerate(_INLETS_COLS):
+                if cell_type != 'entry' or stm_key not in _entry_defaults:
+                    continue
+                val = _entry_defaults[stm_key]
+                if not val:
+                    continue
+                if active_types is not None and code not in active_types:
+                    continue
+                if tree_I.set(siid, hdr).strip() in ('', '--'):
+                    tree_I.set(siid, hdr, val)
+        _regen_names()
+
+    # ==============================
+    # Collect per-line data for save
+    # ==============================
+    def _collect_per_line():
+        result = {}
+        for line_no in _grid_line_nos:
+            siid = str(line_no)
+            entry = {}
+            if tree_L.exists(siid):
+                for hdr, stm_key, _, _, _ in _LINES_COLS:
+                    if not stm_key or stm_key == 'Line No.':
+                        continue
+                    val = tree_L.set(siid, hdr).strip()
+                    if val and val != '--':
+                        entry[stm_key] = val
+            if tree_I.exists(siid):
+                for col_idx, (hdr, stm_key, _, cell_type, _) in enumerate(_INLETS_COLS):
+                    if not stm_key or stm_key == 'Line No.':
+                        continue
+                    if _disabled.get((id(tree_I), siid, col_idx)):
+                        continue
+                    val = tree_I.set(siid, hdr).strip()
+                    if val and val != '--':
+                        if cell_type == 'combo_jtype':
+                            entry[stm_key] = JUNCTION_TYPE_CODES.get(val.lower(), 3)
+                        elif cell_type == 'combo_location':
+                            entry[stm_key] = LOCATION_CODES.get(val.lower(), 0)
+                        else:
+                            entry[stm_key] = val
+            if entry:
+                result[line_no] = entry
+        return result
+
+    # ---- On STM load ----
+    def _on_stm_loaded():
+        p = editor_stm_path[0]
+        if not p or not os.path.isfile(p):
+            return
+        try:
+            _, lines = parse_stm(p)
+            _build_grids(lines)
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+            return
+        _render_plan_view()
+
+    # ---- Save logic ----
+    def _run_editor_save():
+        stm   = editor_stm_path[0]
+        if not stm or not os.path.isfile(stm):
+            messagebox.showwarning("No STM", "Load an .stm file first.")
+            return
+        desig = ent_designation.get().strip()
+        if not desig:
+            messagebox.showwarning("No Designation",
+                                   "Enter a designation (e.g. EB-EC).")
+            return
+        base = os.path.splitext(os.path.basename(stm))[0]
+        op   = filedialog.asksaveasfilename(
+            title="Save edited .stm as",
+            defaultextension=".stm",
+            initialfile=f"{base}_edited.stm",
+            filetypes=[("Hydraflow STM", "*.stm"), ("All files", "*.*")],
+        )
+        if not op:
+            return
+        itype_code = JUNCTION_TYPE_CODES.get(inlet_type_var.get().lower(), 0)
+        loc_code   = LOCATION_CODES.get(location_var.get().lower(), 0)
+        defaults_dict = {
+            'inlet_type':    itype_code,
+            'location':      loc_code,
+            'runoff_coeff':  _safe_float(ent_runoff),
+            'sx':            _safe_float(ent_sx),
+            'sw':            _safe_float(ent_sw),
+            'curb_length':   _safe_float(ent_curb_len),
+            'throat_height': _safe_float(ent_throat),
+            'grate_width':   _safe_float(ent_grate_w),
+            'grate_length':  _safe_float(ent_grate_l),
+            'grate_area':    _safe_float(ent_grate_a),
+        }
+        per_line = _collect_per_line()
+        editor_save_btn.configure(state="disabled", text="Saving...")
+
+        def _worker():
+            try:
+                if per_line:
+                    merged, warns = apply_per_line_data(
+                        stm, desig, defaults_dict, per_line)
+                else:
+                    merged, warns = apply_editor_defaults(stm, desig, defaults_dict)
+                with open(op, 'wb') as f:
+                    f.write(merged.encode('utf-8'))
+                msg = f"Saved to:\n{op}"
+                if warns:
+                    msg += f"\n\n{len(warns)} warning(s):\n" + "\n".join(warns[:10])
+                root.after(0, lambda: messagebox.showinfo("Complete", msg))
+            except Exception as e:
+                root.after(0, lambda: messagebox.showerror("Error", str(e)))
+            finally:
+                root.after(0, lambda: editor_save_btn.configure(
+                    state="normal", text="Save As .stm"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ==============================
+    # TAB 1: Lines
+    # ==============================
+    tab_lines = editor_tabview.tab("Lines")
+    tab_lines.grid_columnconfigure(0, weight=1)
+    tab_lines.grid_rowconfigure(1, weight=1)
+
+    dstrip_L = ctk.CTkFrame(tab_lines, corner_radius=8)
+    dstrip_L.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+    ctk.CTkLabel(dstrip_L, text="Designation", font=FONT_BODY, anchor="e"
+                 ).grid(row=0, column=0, sticky="e", padx=(8, 2), pady=4)
+    ent_designation = ctk.CTkEntry(dstrip_L, font=FONT_BODY, height=26, width=120)
+    ent_designation.grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=4)
+    ctk.CTkButton(
+        dstrip_L, text="Regenerate Names", font=FONT_BODY, height=26, width=140,
+        command=lambda: _regen_names(),
+    ).grid(row=0, column=2, sticky="w", padx=(0, 12), pady=4)
+    ent_designation._entry.bind('<FocusOut>', lambda _e: _regen_names())
+    ent_designation._entry.bind('<Return>',   lambda _e: _regen_names())
+
+    _tree_L_frame, tree_L = _make_tree(tab_lines, _LINES_COLS)
+    _tree_L_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+
+    # ==============================
+    # TAB 2: Inlets
+    # ==============================
+    tab_inlets = editor_tabview.tab("Inlets")
+    tab_inlets.grid_columnconfigure(0, weight=1)
+    tab_inlets.grid_rowconfigure(1, weight=1)
+
+    dstrip = ctk.CTkFrame(tab_inlets, corner_radius=8)
     dstrip.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
     for c in range(12):
         dstrip.grid_columnconfigure(c, weight=1 if c % 2 == 1 else 0)
@@ -2740,47 +3273,35 @@ def launch_gui():
         e.grid(row=row, column=col, sticky="ew", padx=(0, 6), pady=2)
         return e
 
-    # Row 0: Designation + Regenerate Names
-    _ds_label("Designation", 0, 0)
-    ent_designation = _ds_entry(0, 1, width=120)
-    ctk.CTkButton(
-        dstrip, text="Regenerate Names", font=FONT_BODY,
-        height=26, width=130, command=lambda: _regen_names(),
-    ).grid(row=0, column=2, columnspan=2, sticky="w", padx=(0, 12), pady=2)
-
-    # Row 1: Inlet Type / Location / Runoff C / Sx / Sw
-    _ds_label("Inlet Type", 1, 0)
+    _ds_label("Inlet Type", 0, 0)
     inlet_type_var = ctk.StringVar(value="Combination Curb and Grate")
     ctk.CTkOptionMenu(
         dstrip, variable=inlet_type_var, font=FONT_BODY, height=26, width=160,
         values=["Manhole", "Curb", "Grate", "Combination Curb and Grate",
                 "Generic", "Drop Curb", "Drop Grate"],
-    ).grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=2)
-
-    _ds_label("Location", 1, 2)
+    ).grid(row=0, column=1, sticky="ew", padx=(0, 6), pady=2)
+    _ds_label("Location", 0, 2)
     location_var = ctk.StringVar(value="On Grade")
     ctk.CTkOptionMenu(
         dstrip, variable=location_var, font=FONT_BODY, height=26, width=100,
         values=["On Grade", "Sag"],
-    ).grid(row=1, column=3, sticky="ew", padx=(0, 6), pady=2)
+    ).grid(row=0, column=3, sticky="ew", padx=(0, 6), pady=2)
+    _ds_label("Runoff C", 0, 4)
+    ent_runoff = _ds_entry(0, 5)
+    _ds_label("Sx", 0, 6)
+    ent_sx = _ds_entry(0, 7)
+    _ds_label("Sw", 0, 8)
+    ent_sw = _ds_entry(0, 9)
 
-    _ds_label("Runoff C", 1, 4)
-    ent_runoff = _ds_entry(1, 5)
-    _ds_label("Sx", 1, 6)
-    ent_sx = _ds_entry(1, 7)
-    _ds_label("Sw", 1, 8)
-    ent_sw = _ds_entry(1, 9)
-
-    # Row 2: Conditional fields (curb/grate) — show/hide based on inlet type
-    lbl_curb_len = ctk.CTkLabel(dstrip, text="Curb Len (ft)", font=FONT_BODY, anchor="e")
+    lbl_curb_len = ctk.CTkLabel(dstrip, text="Curb Len (ft)",  font=FONT_BODY, anchor="e")
     ent_curb_len = ctk.CTkEntry(dstrip, font=FONT_BODY, height=26, width=72)
     lbl_throat   = ctk.CTkLabel(dstrip, text="Throat Ht (in)", font=FONT_BODY, anchor="e")
     ent_throat   = ctk.CTkEntry(dstrip, font=FONT_BODY, height=26, width=72)
-    lbl_grate_w  = ctk.CTkLabel(dstrip, text="Grate W (ft)", font=FONT_BODY, anchor="e")
+    lbl_grate_w  = ctk.CTkLabel(dstrip, text="Grate W (ft)",   font=FONT_BODY, anchor="e")
     ent_grate_w  = ctk.CTkEntry(dstrip, font=FONT_BODY, height=26, width=72)
-    lbl_grate_l  = ctk.CTkLabel(dstrip, text="Grate L (ft)", font=FONT_BODY, anchor="e")
+    lbl_grate_l  = ctk.CTkLabel(dstrip, text="Grate L (ft)",   font=FONT_BODY, anchor="e")
     ent_grate_l  = ctk.CTkEntry(dstrip, font=FONT_BODY, height=26, width=72)
-    lbl_grate_a  = ctk.CTkLabel(dstrip, text="Grate A (sf)", font=FONT_BODY, anchor="e")
+    lbl_grate_a  = ctk.CTkLabel(dstrip, text="Grate A (sf)",   font=FONT_BODY, anchor="e")
     ent_grate_a  = ctk.CTkEntry(dstrip, font=FONT_BODY, height=26, width=72)
 
     def _update_dstrip_conditional(*_):
@@ -2790,8 +3311,8 @@ def launch_gui():
         col = 0
         def _place(lbl, ent):
             nonlocal col
-            lbl.grid(row=2, column=col,     sticky="e", padx=(8, 2), pady=2)
-            ent.grid(row=2, column=col + 1, sticky="ew", padx=(0, 6), pady=2)
+            lbl.grid(row=1, column=col,     sticky="e", padx=(8, 2), pady=2)
+            ent.grid(row=1, column=col + 1, sticky="ew", padx=(0, 6), pady=2)
             col += 2
         def _hide(lbl, ent):
             lbl.grid_remove(); ent.grid_remove()
@@ -2813,433 +3334,17 @@ def launch_gui():
     inlet_type_var.trace_add("write", _update_dstrip_conditional)
     _update_dstrip_conditional()
 
-    # Row 3: Apply button
     ctk.CTkButton(
         dstrip, text="Apply Defaults to Blanks", font=FONT_BODY,
         height=26, fg_color=COLOR_EDITOR, hover_color=_darken(COLOR_EDITOR),
         command=lambda: _apply_defaults_to_blanks(),
-    ).grid(row=3, column=0, columnspan=6, sticky="w", padx=8, pady=(2, 6))
+    ).grid(row=2, column=0, columnspan=6, sticky="w", padx=8, pady=(2, 6))
 
-    # Designation auto-fires name generation on FocusOut / Return
-    ent_designation._entry.bind('<FocusOut>', lambda _e: _regen_names())
-    ent_designation._entry.bind('<Return>',   lambda _e: _regen_names())
-
-    # ==============================
-    # Grid builder helpers
-    # ==============================
-    def _make_grid_section(parent, section_label, grid_row):
-        """Return (section_frame, header_canvas, header_frame, data_canvas,
-                   inner_frame) wired up with independent scrollbars."""
-        sec = ctk.CTkFrame(parent, corner_radius=8)
-        sec.grid(row=grid_row, column=0, sticky="nsew", padx=4, pady=2)
-        sec.grid_columnconfigure(0, weight=1)
-        sec.grid_rowconfigure(1, weight=1)
-
-        # Section label
-        ctk.CTkLabel(
-            sec, text=f" {section_label}",
-            font=("Segoe UI", 10, "bold"), text_color="gray", anchor="w",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
-
-        # Sticky header
-        hdr_cv = tk.Canvas(sec, height=_HDR_H, bg="#1a3a5c", highlightthickness=0)
-        hdr_cv.grid(row=1, column=0, sticky="ew")
-        hdr_fr = tk.Frame(hdr_cv, bg="#1a3a5c")
-        hdr_cv.create_window((0, 0), window=hdr_fr, anchor="nw")
-
-        # Data canvas
-        dat_cv = tk.Canvas(sec, bg="#2b2b2b", highlightthickness=0)
-        dat_cv.grid(row=2, column=0, sticky="nsew")
-        sec.grid_rowconfigure(2, weight=1)
-        inn_fr = tk.Frame(dat_cv, bg="#2b2b2b")
-        dat_cv.create_window((0, 0), window=inn_fr, anchor="nw")
-
-        # Scrollbars
-        vsb = ctk.CTkScrollbar(sec, orientation="vertical", command=dat_cv.yview)
-        vsb.grid(row=1, column=1, rowspan=2, sticky="ns")
-        dat_cv.configure(yscrollcommand=vsb.set)
-
-        hsb = ctk.CTkScrollbar(sec, orientation="horizontal")
-        hsb.grid(row=3, column=0, sticky="ew")
-
-        def _xscroll_both(*args):
-            dat_cv.xview(*args)
-            hdr_cv.xview(*args)
-        hsb.configure(command=_xscroll_both)
-
-        def _on_dat_xscroll(first, last):
-            hsb.set(first, last)
-            hdr_cv.xview_moveto(first)
-        dat_cv.configure(xscrollcommand=_on_dat_xscroll)
-
-        def _on_inn_configure(_evt):
-            bbox = dat_cv.bbox("all")
-            if bbox:
-                dat_cv.configure(scrollregion=bbox)
-                hdr_cv.configure(scrollregion=(bbox[0], 0, bbox[2], _HDR_H))
-        inn_fr.bind("<Configure>", _on_inn_configure)
-
-        def _on_mw(event):
-            dat_cv.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        dat_cv.bind("<MouseWheel>", _on_mw)
-        inn_fr.bind("<MouseWheel>", _on_mw)
-
-        return sec, hdr_cv, hdr_fr, dat_cv, inn_fr
-
-    _lines_sec,  _hdr_cv_L, _hdr_fr_L, _dat_cv_L, _inn_fr_L = \
-        _make_grid_section(tab_per_line, "LINES",  1)
-    _inlets_sec, _hdr_cv_I, _hdr_fr_I, _dat_cv_I, _inn_fr_I = \
-        _make_grid_section(tab_per_line, "INLETS", 2)
+    _tree_I_frame, tree_I = _make_tree(tab_inlets, _INLETS_COLS)
+    _tree_I_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
 
     # ==============================
-    # Keyboard navigation
-    # ==============================
-    def _focus_cell(g_widgets, row_idx, col_idx):
-        w = g_widgets.get((row_idx, col_idx))
-        if w is None:
-            return
-        try:
-            if isinstance(w, ctk.CTkEntry):
-                w._entry.focus_set()
-            elif isinstance(w, ctk.CTkOptionMenu):
-                w._canvas.focus_set()
-            else:
-                w.focus_set()
-        except Exception:
-            pass
-
-    def _bind_nav(widget, g_widgets, col_schema, row_idx, col_idx):
-        nav_cols = [i for i, (_, _, wt, _) in enumerate(col_schema)
-                    if wt != 'label']
-
-        def _prev_nc():
-            return next((c for c in reversed(nav_cols) if c < col_idx), None)
-
-        def _next_nc():
-            return next((c for c in nav_cols if c > col_idx), None)
-
-        def _nrows():
-            return len(_grid_line_nos)
-
-        def _do_tab(_e=None):
-            nr = row_idx + 1
-            _focus_cell(g_widgets, nr if nr < _nrows() else 0, col_idx)
-            return 'break'
-
-        def _do_enter(_e=None):
-            nc = _next_nc()
-            if nc is not None:
-                _focus_cell(g_widgets, row_idx, nc)
-            else:
-                nr = row_idx + 1
-                _focus_cell(g_widgets,
-                            nr if nr < _nrows() else 0,
-                            nav_cols[0] if nav_cols else col_idx)
-            return 'break'
-
-        def _do_up(_e=None):
-            if row_idx > 0:
-                _focus_cell(g_widgets, row_idx - 1, col_idx)
-            return 'break'
-
-        def _do_left(_e=None):
-            pc = _prev_nc()
-            if pc is not None:
-                _focus_cell(g_widgets, row_idx, pc)
-            elif row_idx > 0 and nav_cols:
-                _focus_cell(g_widgets, row_idx - 1, nav_cols[-1])
-            return 'break'
-
-        if isinstance(widget, ctk.CTkEntry):
-            inner = widget._entry
-            inner.bind('<Tab>',    _do_tab)
-            inner.bind('<Return>', _do_enter)
-            inner.bind('<Up>',     _do_up)
-            # Left only navigates when cursor is at start of text
-            def _left_guard(e):
-                if inner.index('insert') == 0:
-                    return _do_left()
-            inner.bind('<Left>', _left_guard)
-
-        elif isinstance(widget, ctk.CTkOptionMenu):
-            try:
-                cv = widget._canvas
-                cv.configure(takefocus=True)
-                cv.bind('<Tab>',    _do_tab)
-                cv.bind('<Return>', _do_enter)
-                cv.bind('<Up>',     _do_up)
-                cv.bind('<Left>',   _do_left)
-                cv.bind('<space>',  lambda e: (widget._clicked(), 'break')[1])
-            except AttributeError:
-                pass
-
-    # ==============================
-    # Grid population
-    # ==============================
-    def _build_one_grid(inn_fr, hdr_fr, g_vars, g_widgets, col_schema, lines_dict):
-        for w in inn_fr.winfo_children():  w.destroy()
-        for w in hdr_fr.winfo_children():  w.destroy()
-        g_vars.clear()
-        g_widgets.clear()
-
-        # Header
-        x_off = 0
-        for hdr, _, wtype, _ in col_schema:
-            cw = _COL_W[wtype]
-            tk.Label(
-                hdr_fr, text=hdr, width=0,
-                bg="#1a3a5c", fg="#a0c0e0",
-                font=("Segoe UI", 9, "bold"), relief="flat", anchor="center",
-            ).place(x=x_off, y=0, width=cw, height=_HDR_H)
-            x_off += cw
-        hdr_fr.configure(width=x_off, height=_HDR_H)
-
-        # Rows
-        for row_idx, line_no in enumerate(_grid_line_nos):
-            data = lines_dict.get(line_no, {})
-            for col_idx, (_, stm_key, wtype, active_types) in enumerate(col_schema):
-                cw = _COL_W[wtype]
-
-                if wtype == 'label':
-                    wid = ctk.CTkLabel(
-                        inn_fr, text=str(line_no),
-                        font=FONT_BODY, width=cw, anchor="center",
-                    )
-                    wid.grid(row=row_idx, column=col_idx, padx=1, pady=1, sticky="nsew")
-                    g_widgets[(row_idx, col_idx)] = wid
-
-                elif wtype == 'entry':
-                    var = ctk.StringVar()
-                    raw = data.get(stm_key, '')
-                    if raw != '' and raw is not None:
-                        var.set(str(raw))
-                    wid = ctk.CTkEntry(
-                        inn_fr, textvariable=var,
-                        font=FONT_BODY, height=28, width=cw,
-                    )
-                    wid.grid(row=row_idx, column=col_idx, padx=1, pady=1, sticky="nsew")
-                    g_vars[(row_idx, col_idx)]    = var
-                    g_widgets[(row_idx, col_idx)] = wid
-                    _bind_nav(wid, g_widgets, col_schema, row_idx, col_idx)
-
-                elif wtype == 'option_jtype':
-                    raw_code = data.get(stm_key, 3)
-                    display  = _JTYPE_DISPLAY.get(
-                        raw_code if isinstance(raw_code, int) else 3,
-                        'Combination Curb and Grate')
-                    var = ctk.StringVar(value=display)
-                    wid = ctk.CTkOptionMenu(
-                        inn_fr, variable=var, values=_JTYPE_VALUES,
-                        font=FONT_BODY, height=28, width=cw,
-                    )
-                    wid.grid(row=row_idx, column=col_idx, padx=1, pady=1, sticky="nsew")
-                    g_vars[(row_idx, col_idx)]    = var
-                    g_widgets[(row_idx, col_idx)] = wid
-                    _bind_nav(wid, g_widgets, col_schema, row_idx, col_idx)
-                    var.trace_add("write",
-                                  lambda *_, ri=row_idx: _update_inlet_row_states(ri))
-
-                elif wtype == 'option_linetype':
-                    raw_lt  = data.get(stm_key, 'Circular')
-                    display = raw_lt if raw_lt in _LINETYPE_VALUES else 'Circular'
-                    var = ctk.StringVar(value=display)
-                    wid = ctk.CTkOptionMenu(
-                        inn_fr, variable=var, values=_LINETYPE_VALUES,
-                        font=FONT_BODY, height=28, width=cw,
-                    )
-                    wid.grid(row=row_idx, column=col_idx, padx=1, pady=1, sticky="nsew")
-                    g_vars[(row_idx, col_idx)]    = var
-                    g_widgets[(row_idx, col_idx)] = wid
-                    _bind_nav(wid, g_widgets, col_schema, row_idx, col_idx)
-
-                elif wtype == 'option_location':
-                    raw_loc = data.get(stm_key, 0)
-                    display = 'On Grade' if raw_loc == 0 else 'Sag'
-                    var = ctk.StringVar(value=display)
-                    wid = ctk.CTkOptionMenu(
-                        inn_fr, variable=var, values=_LOCATION_VALUES,
-                        font=FONT_BODY, height=28, width=cw,
-                    )
-                    wid.grid(row=row_idx, column=col_idx, padx=1, pady=1, sticky="nsew")
-                    g_vars[(row_idx, col_idx)]    = var
-                    g_widgets[(row_idx, col_idx)] = wid
-                    _bind_nav(wid, g_widgets, col_schema, row_idx, col_idx)
-
-    def _build_grids(lines_dict):
-        nonlocal _grid_line_nos
-        _grid_line_nos = sorted(lines_dict.keys())
-        _build_one_grid(_inn_fr_L, _hdr_fr_L, _L_vars, _L_widgets,
-                        _LINES_COLS, lines_dict)
-        _build_one_grid(_inn_fr_I, _hdr_fr_I, _I_vars, _I_widgets,
-                        _INLETS_COLS, lines_dict)
-        for ri in range(len(_grid_line_nos)):
-            _update_inlet_row_states(ri)
-
-    # ==============================
-    # Conditional cell states (Inlets grid)
-    # ==============================
-    _INLETS_JTYPE_COL = next(
-        (i for i, (_, _, wt, _) in enumerate(_INLETS_COLS) if wt == 'option_jtype'), None)
-
-    def _update_inlet_row_states(row_idx):
-        """Set conditional entry cells to '--'/disabled or active based on Junction Type."""
-        if _INLETS_JTYPE_COL is None:
-            return
-        jtype_var = _I_vars.get((row_idx, _INLETS_JTYPE_COL))
-        if jtype_var is None:
-            return
-        code = JUNCTION_TYPE_CODES.get(jtype_var.get().lower(), -1)
-
-        for col_idx, (_, _, wtype, active_types) in enumerate(_INLETS_COLS):
-            if active_types is None or wtype != 'entry':
-                continue
-            wid = _I_widgets.get((row_idx, col_idx))
-            var = _I_vars.get((row_idx, col_idx))
-            if wid is None or var is None:
-                continue
-            if code in active_types:
-                wid.configure(state='normal')
-                if var.get() == '--':
-                    var.set('')
-            else:
-                if var.get().strip() in ('', '--'):
-                    var.set('--')
-                wid.configure(state='disabled')
-
-    # ==============================
-    # Designation auto-naming
-    # ==============================
-    def _regen_names():
-        p     = editor_stm_path[0]
-        desig = ent_designation.get().strip()
-        if not p or not desig or not _grid_line_nos:
-            return
-        try:
-            _, lines = parse_stm(p)
-            names, _ = generate_names(lines, desig)
-        except Exception:
-            return
-
-        line_id_col  = next((i for i, (_, k, _, _) in enumerate(_LINES_COLS)
-                             if k == 'Line ID'), None)
-        inlet_id_col = next((i for i, (_, k, _, _) in enumerate(_INLETS_COLS)
-                             if k == 'Inlet ID'), None)
-
-        for row_idx, line_no in enumerate(_grid_line_nos):
-            if line_no not in names:
-                continue
-            if line_id_col is not None:
-                var = _L_vars.get((row_idx, line_id_col))
-                if var is not None and var.get().strip() in ('', '--'):
-                    var.set(names[line_no].get('Line ID', ''))
-            if inlet_id_col is not None:
-                var = _I_vars.get((row_idx, inlet_id_col))
-                if var is not None and var.get().strip() in ('', '--'):
-                    var.set(names[line_no].get('Inlet ID', ''))
-
-    # ==============================
-    # Apply Defaults to Blanks
-    # ==============================
-    def _apply_defaults_to_blanks():
-        if not _grid_line_nos:
-            return
-
-        itype_code    = JUNCTION_TYPE_CODES.get(inlet_type_var.get().lower(), 0)
-        itype_display = _JTYPE_DISPLAY.get(itype_code, 'Combination Curb and Grate')
-        loc_display   = 'On Grade' if LOCATION_CODES.get(
-            location_var.get().lower(), 0) == 0 else 'Sag'
-
-        # Map STM key → default value string for entry fields
-        _entry_defaults = {
-            'Runoff Coeff.':         ent_runoff.get().strip(),
-            'Inlet Cross Slope Sx':  ent_sx.get().strip(),
-            'Inlet Cross Slope Sw':  ent_sw.get().strip(),
-            'Inlet Length':          ent_curb_len.get().strip(),
-            'Inlet throat height':   ent_throat.get().strip(),
-            'Grate Width':           ent_grate_w.get().strip(),
-            'Grate Length':          ent_grate_l.get().strip(),
-            'Grate Opening Area':    ent_grate_a.get().strip(),
-        }
-
-        def _fill_blank(var, value):
-            if value and var.get().strip() in ('', '--'):
-                var.set(value)
-
-        # Lines grid — entry fields only
-        for col_idx, (_, stm_key, wtype, _) in enumerate(_LINES_COLS):
-            if wtype != 'entry' or stm_key not in _entry_defaults:
-                continue
-            val = _entry_defaults[stm_key]
-            if not val:
-                continue
-            for row_idx in range(len(_grid_line_nos)):
-                var = _L_vars.get((row_idx, col_idx))
-                if var:
-                    _fill_blank(var, val)
-
-        # Inlets grid — Junction Type, Location, and conditional entry fields
-        jtype_col = next((i for i, (_, k, _, _) in enumerate(_INLETS_COLS)
-                          if k == 'Junction Type'), None)
-        loc_col   = next((i for i, (_, k, _, _) in enumerate(_INLETS_COLS)
-                          if k == 'Inlet Sag'), None)
-
-        for row_idx in range(len(_grid_line_nos)):
-            if jtype_col is not None:
-                var = _I_vars.get((row_idx, jtype_col))
-                if var:
-                    _fill_blank(var, itype_display)
-            if loc_col is not None:
-                var = _I_vars.get((row_idx, loc_col))
-                if var:
-                    _fill_blank(var, loc_display)
-
-            for col_idx, (_, stm_key, wtype, active_types) in enumerate(_INLETS_COLS):
-                if wtype != 'entry' or stm_key not in _entry_defaults:
-                    continue
-                val = _entry_defaults[stm_key]
-                if not val:
-                    continue
-                # Don't fill cells that are N/A for this row's junction type
-                if active_types is not None:
-                    jv = _I_vars.get((row_idx, _INLETS_JTYPE_COL)) \
-                         if _INLETS_JTYPE_COL is not None else None
-                    code = JUNCTION_TYPE_CODES.get(
-                        jv.get().lower(), -1) if jv else -1
-                    if code not in active_types:
-                        continue
-                var = _I_vars.get((row_idx, col_idx))
-                if var:
-                    _fill_blank(var, val)
-
-        # Also push names
-        _regen_names()
-
-    # ==============================
-    # Collect per-line data for save
-    # ==============================
-    def _collect_per_line():
-        """Return {line_no: {stm_key: value_str}} from both grids, skipping blanks/--."""
-        result = {}
-
-        def _harvest(g_vars, col_schema):
-            for (row_idx, col_idx), var in g_vars.items():
-                if row_idx >= len(_grid_line_nos):
-                    continue
-                _, stm_key, _, _ = col_schema[col_idx]
-                if stm_key is None:
-                    continue
-                val = var.get().strip()
-                if not val or val == '--':
-                    continue
-                line_no = _grid_line_nos[row_idx]
-                result.setdefault(line_no, {})[stm_key] = val
-
-        _harvest(_L_vars, _LINES_COLS)
-        _harvest(_I_vars, _INLETS_COLS)
-        return result
-
-    # ==============================
-    # TAB 2: Plan View
+    # TAB 3: Plan View
     # ==============================
     tab_plan = editor_tabview.tab("Plan View")
     tab_plan.grid_columnconfigure(0, weight=1)
@@ -3275,82 +3380,8 @@ def launch_gui():
         except Exception as e:
             messagebox.showerror("Plan View Error", str(e))
 
-    # ---- On STM load ----
-    def _on_stm_loaded():
-        p = editor_stm_path[0]
-        if not p or not os.path.isfile(p):
-            return
-        try:
-            _, lines = parse_stm(p)
-            _build_grids(lines)
-        except Exception as e:
-            messagebox.showerror("Load Error", str(e))
-            return
-        _render_plan_view()
-
-    # ---- Save logic ----
-    def _run_editor_save():
-        stm   = editor_stm_path[0]
-        if not stm or not os.path.isfile(stm):
-            messagebox.showwarning("No STM", "Load an .stm file first.")
-            return
-        desig = ent_designation.get().strip()
-        if not desig:
-            messagebox.showwarning("No Designation",
-                                   "Enter a designation (e.g. EB-EC).")
-            return
-
-        base = os.path.splitext(os.path.basename(stm))[0]
-        op   = filedialog.asksaveasfilename(
-            title="Save edited .stm as",
-            defaultextension=".stm",
-            initialfile=f"{base}_edited.stm",
-            filetypes=[("Hydraflow STM", "*.stm"), ("All files", "*.*")],
-        )
-        if not op:
-            return
-
-        itype_code = JUNCTION_TYPE_CODES.get(inlet_type_var.get().lower(), 0)
-        loc_code   = LOCATION_CODES.get(location_var.get().lower(), 0)
-
-        defaults_dict = {
-            'inlet_type':    itype_code,
-            'location':      loc_code,
-            'runoff_coeff':  _safe_float(ent_runoff),
-            'sx':            _safe_float(ent_sx),
-            'sw':            _safe_float(ent_sw),
-            'curb_length':   _safe_float(ent_curb_len),
-            'throat_height': _safe_float(ent_throat),
-            'grate_width':   _safe_float(ent_grate_w),
-            'grate_length':  _safe_float(ent_grate_l),
-            'grate_area':    _safe_float(ent_grate_a),
-        }
-
-        per_line = _collect_per_line()
-        editor_save_btn.configure(state="disabled", text="Saving...")
-
-        def _worker():
-            try:
-                if per_line:
-                    merged, warns = apply_per_line_data(
-                        stm, desig, defaults_dict, per_line)
-                else:
-                    merged, warns = apply_editor_defaults(stm, desig, defaults_dict)
-                with open(op, 'wb') as f:
-                    f.write(merged.encode('utf-8'))
-                msg = f"Saved to:\n{op}"
-                if warns:
-                    msg += f"\n\n{len(warns)} warning(s):\n" + "\n".join(warns[:10])
-                root.after(0, lambda: messagebox.showinfo("Complete", msg))
-            except Exception as e:
-                root.after(0, lambda: messagebox.showerror("Error", str(e)))
-            finally:
-                root.after(0, lambda: editor_save_btn.configure(
-                    state="normal", text="Save As .stm"))
-
-        threading.Thread(target=_worker, daemon=True).start()
-
     pages["editor"] = editor_frame
+
 
     # Route drops to whichever page is currently active.
     # Registering on root covers all child widgets with no propagation issues.
