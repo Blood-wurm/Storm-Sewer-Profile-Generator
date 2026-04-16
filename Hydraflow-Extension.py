@@ -790,6 +790,168 @@ def apply_per_line_data(stm_path, designation, defaults, per_line):
     return line_ending.join(raw_lines), warnings
 
 
+# ---- Field order template for .stm line blocks ---------------------------
+
+_STM_BLOCK_FIELD_ORDER = [
+    'Line No.',
+    'Line ID',
+    'Downstream Line No.',
+    # X,Y coords are handled specially (two values per line)
+    '__XY_DN__',
+    '__XY_UP__',
+    'Deflection Angle',
+    'Bearing',
+    'Known Q',
+    'Sub Drainage Area 1',
+    'Sub Drainage Area 2',
+    'Sub Drainage Area 3',
+    'Drainage Area',
+    'Runoff Coeff.',
+    'Inlet Time',
+    'Line Length',
+    'Invert Elev Dn',
+    'Line Slope',
+    'Invert Elev Up',
+    'Rise',
+    'Span',
+    'N-Value',
+    'Line Type',
+    'Junction Loss Coeff',
+    'Ground / Rim Elev Dn',
+    'Ground / Rim Elev Up',
+    'Junction Type',
+    'Downstream Inlet No.',
+    'Inlet Length',
+    'Inlet throat height',
+    'Grate Opening Area',
+    'Grate Width',
+    'Grate Length',
+    'Known Capacity',
+    'Gutter Width',
+    'Gutter Slope',
+    'Inlet Cross Slope Sw',
+    'Inlet Cross Slope Sx',
+    'Inlet Sag',
+    'Inlet ID',
+    'Local Inlet Depression',
+    'Gutter N-Value',
+]
+
+def _coerce_for_stm(key, val):
+    """Coerce a value (possibly a UI string) to the proper type for .stm."""
+    if val is None or val == '':
+        return 0 if key not in _STM_STRING_FIELDS else ''
+    if key in _STM_STRING_FIELDS:
+        return str(val)
+    if isinstance(val, (int, float)):
+        return val
+    # UI strings — convert to number
+    s = str(val).strip()
+    try:
+        if '.' in s:
+            return float(s)
+        return int(s)
+    except ValueError:
+        return 0
+
+
+def _format_stm_block(data):
+    """Format a single line block from a merged data dict.
+    Returns list of .stm text lines (no trailing separator)."""
+    out = []
+    for field in _STM_BLOCK_FIELD_ORDER:
+        if field == '__XY_DN__':
+            xd = _coerce_for_stm('X Coord Dn', data.get('X Coord Dn', 0))
+            yd = _coerce_for_stm('Y Coord Dn', data.get('Y Coord Dn', 0))
+            out.append(f'"X,Y Coord Dn = ",{_fmt_stm_num(xd)},{_fmt_stm_num(yd)}')
+            continue
+        if field == '__XY_UP__':
+            xu = _coerce_for_stm('X Coord Up', data.get('X Coord Up', 0))
+            yu = _coerce_for_stm('Y Coord Up', data.get('Y Coord Up', 0))
+            out.append(f'"X,Y Coord Up = ",{_fmt_stm_num(xu)},{_fmt_stm_num(yu)}')
+            continue
+        val = _coerce_for_stm(field, data.get(field))
+        out.append(_format_stm_line(field, val))
+    return out
+
+
+def rebuild_stm(stm_path, L_data, I_data):
+    """Rebuild a .stm file using the original header/footer but with
+    LINE DATA reconstructed entirely from the in-memory dicts.
+
+    L_data: {line_no: {stm_key: value}}  — Lines tab + coords + geometry
+    I_data: {line_no: {stm_key: value}}  — Inlets tab data
+
+    Returns (text, warnings).
+    """
+    # --- Read original file for header and footer ---
+    with open(stm_path, 'rb') as f:
+        raw_bytes = f.read()
+    line_ending = '\r\n' if b'\r\n' in raw_bytes else '\n'
+    raw = raw_bytes.decode('utf-8', errors='replace')
+    raw = raw.replace('\r\n', '\n').replace('\r', '\n')
+    raw_lines = raw.split('\n')
+
+    warnings = []
+
+    # --- Split into header, line-data, footer ---
+    header_end   = None    # index of "LINE DATA" line
+    footer_start = None    # index of "IDF Curves" or "Number of Parcel" line
+
+    for idx, row in enumerate(raw_lines):
+        stripped = row.strip()
+        if 'LINE DATA' in stripped:
+            header_end = idx
+        if ('"IDF Curves"' in stripped or '"Number of Parcel' in stripped):
+            footer_start = idx
+            break
+
+    if header_end is None:
+        warnings.append("Could not locate LINE DATA marker in original .stm")
+        return line_ending.join(raw_lines), warnings
+
+    # Header = everything up to and including "LINE DATA" line
+    header = raw_lines[:header_end + 1]
+
+    # Update "Total No. Lines" in header
+    num_lines = len(L_data)
+    for i, row in enumerate(header):
+        if '"Total No. Lines' in row:
+            header[i] = f'"Total No. Lines = ",{num_lines}'
+            break
+
+    # Footer = everything from IDF/Parcels onward (or empty if not found)
+    footer = raw_lines[footer_start:] if footer_start is not None else []
+
+    # --- Rebuild LINE DATA from in-memory dicts ---
+    all_line_nos = sorted(set(L_data.keys()) | set(I_data.keys()))
+    line_data_section = []
+
+    for line_no in all_line_nos:
+        # Merge: start with L_data (has coords, geometry), overlay I_data
+        merged = {}
+        if line_no in L_data:
+            merged.update(L_data[line_no])
+        if line_no in I_data:
+            # Only overlay inlet-specific keys from I_data
+            for k, v in I_data[line_no].items():
+                if k in merged and k in ('X Coord Dn', 'Y Coord Dn',
+                                         'X Coord Up', 'Y Coord Up',
+                                         'Deflection Angle', 'Bearing',
+                                         'Line Length'):
+                    continue    # L_data owns geometry/coords
+                merged[k] = v
+        merged['Line No.'] = line_no
+
+        block_lines = _format_stm_block(merged)
+        line_data_section.extend(block_lines)
+        line_data_section.append('"---------------------------------------"')
+
+    # --- Assemble ---
+    result = header + line_data_section + footer
+    return line_ending.join(result), warnings
+
+
 # =============================================================================
 # SECTION 2: DOT TABULATION PDF PARSER
 # =============================================================================
@@ -3276,10 +3438,8 @@ def launch_gui():
         if not stm or not os.path.isfile(stm):
             messagebox.showwarning("No STM", "Load an .stm file first.")
             return
-        desig = ent_designation.get().strip()
-        if not desig:
-            messagebox.showwarning("No Designation",
-                                   "Enter a designation (e.g. EB-EC).")
+        if not _L_data:
+            messagebox.showwarning("No Data", "No line data to save.")
             return
         base = os.path.splitext(os.path.basename(stm))[0]
         op   = filedialog.asksaveasfilename(
@@ -3290,30 +3450,14 @@ def launch_gui():
         )
         if not op:
             return
-        itype_code = JUNCTION_TYPE_CODES.get(inlet_type_var.get().lower(), 0)
-        loc_code   = LOCATION_CODES.get(location_var.get().lower(), 0)
-        defaults_dict = {
-            'inlet_type':    itype_code,
-            'location':      loc_code,
-            'runoff_coeff':  _safe_float(ent_runoff),
-            'sx':            _safe_float(ent_sx),
-            'sw':            _safe_float(ent_sw),
-            'curb_length':   _safe_float(ent_curb_len),
-            'throat_height': _safe_float(ent_throat),
-            'grate_width':   _safe_float(ent_grate_w),
-            'grate_length':  _safe_float(ent_grate_l),
-            'grate_area':    _safe_float(ent_grate_a),
-        }
-        per_line = _collect_per_line()
+        # Snapshot in-memory data for the background thread
+        L_snap = {ln: dict(d) for ln, d in _L_data.items()}
+        I_snap = {ln: dict(d) for ln, d in _I_data.items()}
         editor_save_btn.configure(state="disabled", text="Saving...")
 
         def _worker():
             try:
-                if per_line:
-                    merged, warns = apply_per_line_data(
-                        stm, desig, defaults_dict, per_line)
-                else:
-                    merged, warns = apply_editor_defaults(stm, desig, defaults_dict)
+                merged, warns = rebuild_stm(stm, L_snap, I_snap)
                 with open(op, 'wb') as f:
                     f.write(merged.encode('utf-8'))
                 msg = f"Saved to:\n{op}"
