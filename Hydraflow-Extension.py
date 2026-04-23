@@ -875,28 +875,6 @@ def _format_stm_block(data):
     return out
 
 
-# Fields owned by the Inlets tab (overlaid from I_data over L_data).
-# All other fields come from L_data exclusively.
-_INLETS_OWNED_FIELDS = frozenset({
-    'Inlet ID',
-    'Junction Type',
-    'Inlet Sag',
-    'Downstream Inlet No.',
-    'Inlet Length',
-    'Inlet throat height',
-    'Grate Opening Area',
-    'Grate Width',
-    'Grate Length',
-    'Known Capacity',
-    'Inlet Cross Slope Sx',
-    'Inlet Cross Slope Sw',
-    'Local Inlet Depression',
-    'Gutter Width',
-    'Gutter Slope',
-    'Gutter N-Value',
-})
-
-
 def rebuild_stm(stm_path, L_data, I_data):
     """Rebuild a .stm file using the original header/footer but with
     LINE DATA reconstructed entirely from the in-memory dicts.
@@ -950,15 +928,19 @@ def rebuild_stm(stm_path, L_data, I_data):
     line_data_section = []
 
     for line_no in all_line_nos:
-        # Start with L_data (authoritative for everything except Inlets-tab fields)
+        # Merge: start with L_data (has coords, geometry), overlay I_data
         merged = {}
         if line_no in L_data:
             merged.update(L_data[line_no])
-        # Overlay only Inlets-tab-owned fields from I_data
         if line_no in I_data:
+            # Only overlay inlet-specific keys from I_data
             for k, v in I_data[line_no].items():
-                if k in _INLETS_OWNED_FIELDS:
-                    merged[k] = v
+                if k in merged and k in ('X Coord Dn', 'Y Coord Dn',
+                                         'X Coord Up', 'Y Coord Up',
+                                         'Deflection Angle', 'Bearing',
+                                         'Line Length'):
+                    continue    # L_data owns geometry/coords
+                merged[k] = v
         merged['Line No.'] = line_no
 
         block_lines = _format_stm_block(merged)
@@ -2039,10 +2021,19 @@ def _create_check_summary_pages(all_failures):
         ax.text(0.0, 0.97, count_text, transform=ax.transAxes, ha='left', va='top',
                 fontsize=10, color='#CC0000')
 
+        # Use fixed row heights so a short table doesn't stretch to fill the page.
+        # Page usable height ~0.92 (axes coords); allocate per-row height and
+        # anchor the table near the top.
+        header_h = 0.035          # fraction of axes height for the header row
+        row_h    = 0.030          # fraction of axes height per data row
+        top_y    = 0.94           # top of the table (just below the title area)
+        total_h  = header_h + row_h * len(page_rows)
+        bottom_y = max(0.02, top_y - total_h)
+
         tbl = ax.table(
             cellText=page_rows, colLabels=col_labels,
             loc='upper center', cellLoc='center',
-            bbox=[0.0, 0.02, 1.0, 0.92],
+            bbox=[0.0, bottom_y, 1.0, top_y - bottom_y],
         )
         tbl.auto_set_font_size(False)
         tbl.set_fontsize(8)
@@ -2764,6 +2755,19 @@ def launch_gui():
     _plan_canvas_widget = [None]
     _plan_refresh_id    = [None]   # after-id for debounced plan refresh
 
+    # Auto-filled cells: set of (line_no, stm_key) for Dn inverts/rims
+    # populated by propagation from an upstream pipe's Up value.
+    # Cells in this set are cleared when the driving Up value is cleared.
+    # Any direct user edit removes a cell from this set (becomes manual).
+    _autofilled        = set()
+
+    # Columns that participate in the Up -> Dn auto-fill chain.
+    # Format: up_key -> dn_key
+    _AUTOFILL_UP_TO_DN = {
+        'Invert Elev Up':         'Invert Elev Dn',
+        'Ground / Rim Elev Up':   'Ground / Rim Elev Dn',
+    }
+
     _JTYPE_DISPLAY   = {
         0: 'Manhole', 1: 'Curb', 2: 'Grate', 3: 'Combination Curb and Grate',
         4: 'Generic', 5: 'Drop Curb', 6: 'Drop Grate', 7: 'Open Headwall', 8: 'None',
@@ -2997,7 +3001,13 @@ def launch_gui():
                 exists = False
             if exists:
                 val = w.get().strip() if hasattr(w, 'get') else ''
-                if val and iid and hdr and tree and tree.exists(iid):
+                # Allow both filled and cleared (empty) commits for auto-fill fields
+                is_autofill_field = (tree is tree_L and
+                                     stm_key in _AUTOFILL_UP_TO_DN)
+                is_autofill_dn = (tree is tree_L and
+                                  stm_key in _AUTOFILL_UP_TO_DN.values())
+                process = bool(val) or is_autofill_field or is_autofill_dn
+                if process and iid and hdr and tree and tree.exists(iid):
                     tree.set(iid, hdr, val)
                     data = _L_data if tree is tree_L else _I_data
                     try:
@@ -3005,12 +3015,37 @@ def launch_gui():
                     except (ValueError, TypeError):
                         ln = None
                     if ln is not None and stm_key and stm_key != 'Line No.':
-                        data.setdefault(ln, {})[stm_key] = val
+                        if val:
+                            data.setdefault(ln, {})[stm_key] = val
+                        else:
+                            # Clearing removes the stored value
+                            if ln in data:
+                                data[ln].pop(stm_key, None)
                         # Keep plan-view-relevant fields in sync across both dicts
                         other = _I_data if tree is tree_L else _L_data
                         if stm_key in ('Line ID', 'Inlet ID',
                                        'Downstream Line No.'):
-                            other.setdefault(ln, {})[stm_key] = val
+                            if val:
+                                other.setdefault(ln, {})[stm_key] = val
+                            elif ln in other:
+                                other[ln].pop(stm_key, None)
+
+                        # Direct user edit on a Dn cell => mark as manual
+                        # (remove from auto-filled tracking)
+                        if is_autofill_dn and ln is not None:
+                            _autofilled.discard((ln, stm_key))
+
+                        # Propagate Up-value edits to upstream pipes' Dn cells
+                        if is_autofill_field and ln is not None:
+                            _propagate_autofill(ln, stm_key, val)
+
+                        # Recalculate slope if an invert changed on this line
+                        if stm_key in ('Invert Elev Up', 'Invert Elev Dn',
+                                       'Line Length') and ln is not None:
+                            if val:
+                                _recalc_slope_for_line(ln)
+                            elif stm_key in ('Invert Elev Up', 'Invert Elev Dn'):
+                                _clear_slope_for_line(ln)
                     if schema is _INLETS_COLS and stm_key == 'Junction Type':
                         _update_inlet_row_states(iid)
                     if stm_key == 'Line No.':
@@ -3172,6 +3207,7 @@ def launch_gui():
         _grid_line_nos = sorted(lines_dict.keys())
         _L_data.clear()
         _I_data.clear()
+        _autofilled.clear()   # Existing values on load are treated as manual
         for ln, d in lines_dict.items():
             _L_data[ln] = dict(d)
             _I_data[ln] = dict(d)
@@ -3220,6 +3256,15 @@ def launch_gui():
             _L_data[new_no] = _L_data.pop(old_no)
         if old_no in _I_data:
             _I_data[new_no] = _I_data.pop(old_no)
+        # Re-key autofill tracking for renamed line
+        remapped = set()
+        for (ln, key) in _autofilled:
+            if ln == old_no:
+                remapped.add((new_no, key))
+            else:
+                remapped.add((ln, key))
+        _autofilled.clear()
+        _autofilled.update(remapped)
         ds_key = 'Downstream Line No.'
         bp_key = 'Downstream Inlet No.'
         for ln in list(_L_data.keys()):
@@ -3244,6 +3289,103 @@ def launch_gui():
         for ii in tree_I.get_children():
             _update_inlet_row_states(ii)
         _schedule_plan_refresh()
+
+    # ==============================
+    # Invert / Rim auto-fill propagation
+    # ==============================
+    def _find_upstream_line_nos(ds_line_no):
+        """Return list of line numbers whose 'Downstream Line No.' == ds_line_no."""
+        result = []
+        for ln, d in _L_data.items():
+            try:
+                if int(d.get('Downstream Line No.', 0)) == ds_line_no:
+                    result.append(ln)
+            except (ValueError, TypeError):
+                continue
+        return result
+
+    def _tree_hdr_for_key(schema, stm_key):
+        """Return the tree column header for a given .stm key, or None."""
+        for hdr, key, *_ in schema:
+            if key == stm_key:
+                return hdr
+        return None
+
+    def _recalc_slope_for_line(line_no):
+        """Recalculate and write Line Slope for a line if both inverts are known."""
+        d = _L_data.get(line_no, {})
+        try:
+            inv_dn = float(d.get('Invert Elev Dn', ''))
+            inv_up = float(d.get('Invert Elev Up', ''))
+        except (ValueError, TypeError):
+            return
+        length = d.get('Line Length')
+        try:
+            length = float(length)
+        except (ValueError, TypeError):
+            return
+        if length <= 0:
+            return
+        slope = round((inv_up - inv_dn) / length * 100, 6)
+        _L_data[line_no]['Line Slope'] = slope
+        siid = str(line_no)
+        slope_hdr = _tree_hdr_for_key(_LINES_COLS, 'Line Slope')
+        if slope_hdr and tree_L.exists(siid):
+            tree_L.set(siid, slope_hdr, str(slope))
+
+    def _clear_slope_for_line(line_no):
+        """Clear Line Slope (memory + grid) — used when an invert is cleared."""
+        if line_no in _L_data:
+            _L_data[line_no].pop('Line Slope', None)
+        siid = str(line_no)
+        slope_hdr = _tree_hdr_for_key(_LINES_COLS, 'Line Slope')
+        if slope_hdr and tree_L.exists(siid):
+            tree_L.set(siid, slope_hdr, '')
+
+    def _propagate_autofill(edited_line_no, up_key, new_val):
+        """Propagate an Up-value edit to connected upstream pipes' Dn cells.
+
+        Rules:
+          - new_val non-empty: for every upstream pipe whose corresponding Dn
+            cell is blank, fill it with new_val and mark as auto-filled.
+            If that pipe was already auto-filled (tracked), overwrite it too
+            (so editing the Up repeatedly keeps children in sync).
+          - new_val empty: clear any Dn cell we had previously auto-filled
+            and recalc (clear) that pipe's slope.
+          - Slope is recalculated on any change.
+        """
+        dn_key = _AUTOFILL_UP_TO_DN.get(up_key)
+        if dn_key is None:
+            return
+        dn_hdr = _tree_hdr_for_key(_LINES_COLS, dn_key)
+        if dn_hdr is None:
+            return
+
+        upstream = _find_upstream_line_nos(edited_line_no)
+        for up_ln in upstream:
+            siid = str(up_ln)
+            if not tree_L.exists(siid):
+                continue
+            key = (up_ln, dn_key)
+            current = tree_L.set(siid, dn_hdr).strip()
+
+            if new_val:
+                # Fill if blank, or overwrite if previously auto-filled
+                if current == '' or key in _autofilled:
+                    tree_L.set(siid, dn_hdr, new_val)
+                    _L_data.setdefault(up_ln, {})[dn_key] = new_val
+                    _autofilled.add(key)
+                    if dn_key == 'Invert Elev Dn':
+                        _recalc_slope_for_line(up_ln)
+            else:
+                # Up was cleared -> clear children we auto-filled
+                if key in _autofilled:
+                    tree_L.set(siid, dn_hdr, '')
+                    if up_ln in _L_data:
+                        _L_data[up_ln].pop(dn_key, None)
+                    _autofilled.discard(key)
+                    if dn_key == 'Invert Elev Dn':
+                        _clear_slope_for_line(up_ln)
 
     # ==============================
     # Designation auto-naming + line renumbering
@@ -3282,6 +3424,15 @@ def launch_gui():
                 if old_no in _I_data:
                     new_I[new_no] = _I_data[old_no]
                     new_I[new_no]['Line No.'] = new_no
+
+            # Re-map _autofilled line numbers to new numbering
+            remapped_autofilled = set()
+            for (old_ln, key) in _autofilled:
+                new_ln = number_map.get(old_ln)
+                if new_ln is not None:
+                    remapped_autofilled.add((new_ln, key))
+            _autofilled.clear()
+            _autofilled.update(remapped_autofilled)
 
             # --- Step 4: Update Downstream Line No. and bypass references ---
             ds_key     = 'Downstream Line No.'
